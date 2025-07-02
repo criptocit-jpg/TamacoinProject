@@ -2,15 +2,15 @@ import os
 import telebot
 from telebot import types
 import datetime
-import time # Для сна, если потребуется (пока не используется напрямую)
-from flask import Flask, request # Для вебхуков
+import time
+from flask import Flask, request
 
 # Убедимся, что текущая рабочая директория - это директория скрипта
-# Это важно для корректного поиска файлов изображений на сервере на Render.com
 script_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(script_dir)
 
 # Импортируем наши менеджеры
+# Убедитесь, что db_manager.py и pet_config.py находятся в той же директории
 from db_manager import db
 from pet_config import (
     PET_TYPES, PET_IMAGES,
@@ -26,7 +26,6 @@ from pet_config import (
 
 # --- Настройка бота и вебхуков ---
 # Получаем токен бота из переменных окружения
-# ВАЖНО: НЕ ВПИСЫВАЙТЕ ТОКЕН НАПРЯМУЮ ЗДЕСЬ! Используйте переменные окружения Render.com
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if BOT_TOKEN is None:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set. Please set it on Render.com")
@@ -49,7 +48,6 @@ def parse_iso_time(iso_str):
     return None
 
 # Функция для обновления состояния питомца (голод, счастье, здоровье)
-# Зависит от прошедшего времени и базовых параметров decay
 def update_pet_stats(pet_data):
     if not pet_data or not pet_data['is_alive']:
         return pet_data
@@ -67,22 +65,21 @@ def update_pet_stats(pet_data):
     if time_diff_hours > 0:
         pet_data['hunger'] = max(0.0, pet_data['hunger'] - (HUNGER_DECAY_PER_HOUR * time_diff_hours))
         pet_data['happiness'] = max(0.0, pet_data['happiness'] - (HAPPINESS_DECAY_PER_HOUR * time_diff_hours))
-        pet_data['health'] = max(0.0, pet_data['health'] - (HEALTH_DECAY_PER_HOUR * time_diff_hours)) # базовое снижение
+        pet_data['health'] = max(0.0, pet_data['health'] - (HEALTH_DECAY_PER_HOUR * time_diff_hours))
         
         # Ухудшение здоровья при низком голоде/счастье
         if pet_data['hunger'] < HUNGER_THRESHOLD_SAD:
-            pet_data['health'] = max(0.0, pet_data['health'] - (HEALTH_DECAY_PER_HOUR * time_diff_hours * 0.5)) # Дополнительное снижение
+            pet_data['health'] = max(0.0, pet_data['health'] - (HEALTH_DECAY_PER_HOUR * time_diff_hours * 0.5))
         if pet_data['happiness'] < HAPPINESS_THRESHOLD_SAD:
-            pet_data['health'] = max(0.0, pet_data['health'] - (HEALTH_DECAY_PER_HOUR * time_diff_hours * 0.5)) # Дополнительное снижение
+            pet_data['health'] = max(0.0, pet_data['health'] - (HEALTH_DECAY_PER_HOUR * time_diff_hours * 0.5))
         
         pet_data['last_state_update'] = get_current_iso_time()
 
         # Проверка на смерть
         if pet_data['hunger'] <= 0 or pet_data['happiness'] <= 0 or pet_data['health'] <= 0:
-            if pet_data['is_alive']: # Убедимся, что не убиваем уже мертвого
+            if pet_data['is_alive']:
                 db.kill_pet(pet_data['owner_id'])
                 pet_data['is_alive'] = 0
-                # Уведомляем пользователя о смерти питомца
                 user = db.get_user_by_db_id(pet_data['owner_id'])
                 if user:
                     bot.send_message(user['telegram_id'],
@@ -90,37 +87,31 @@ def update_pet_stats(pet_data):
                                      f"Вы можете завести нового питомца за {NEW_PET_COST} Tamacoin с помощью команды /buy_pet.",
                                      parse_mode='Markdown')
             
-        # Обновляем состояние питомца в БД (только если жив или только что умер)
         db.update_pet_state(pet_data['owner_id'], pet_data['hunger'], pet_data['happiness'], pet_data['health'], pet_data['last_state_update'])
     
     return pet_data
 
 # Функция для получения актуального статуса питомца и его изображения
 def get_pet_status_and_image(user_id, pet_data):
-    # Обновляем статистику питомца перед отображением
     pet_data = update_pet_stats(pet_data)
 
     if not pet_data or not pet_data['is_alive']:
-        return "У вас пока нет питомца или он мертв. Используйте /start, чтобы завести нового или /buy_pet, чтобы приобрести.", PET_IMAGES['dead_pet']
+        return "У вас пока нет питомца или он мертв. Используйте /start, чтобы завести нового или /buy_pet, чтобы приобрести.", PET_IMAGES.get('dead_pet')
 
     status_text = f"Ваш питомец: *{pet_data['name']}* ({PET_TYPES[pet_data['pet_type']]['name']})\n\n"
     status_text += f"Голод: `{pet_data['hunger']:.1f}%`\n"
     status_text += f"Счастье: `{pet_data['happiness']:.1f}%`\n"
     status_text += f"Здоровье: `{pet_data['health']:.1f}%`\n"
 
-    # Выбираем изображение в зависимости от состояния
-    image_key = pet_data['pet_type'] # Базовое изображение
+    image_key = pet_data['pet_type']
     
     if pet_data['hunger'] < HUNGER_THRESHOLD_SAD or \
        pet_data['happiness'] < HAPPINESS_THRESHOLD_SAD or \
        pet_data['health'] < HEALTH_THRESHOLD_SICK:
         
-        # Если есть специфичное изображение для "грустного" состояния, используем его
-        if PET_IMAGES.get(pet_data['pet_type'] + '_hungry'):
+        if PET_IMAGES.get(pet_data['pet_type'] + '_hungry'): # Предполагаем, что 'hungry' может быть общим для всех плохих состояний
             image_key = pet_data['pet_type'] + '_hungry'
-        # Иначе остаемся с базовым изображением
 
-    # Если есть конкретное изображение для "больного" состояния, оно имеет приоритет
     if pet_data['health'] < HEALTH_THRESHOLD_SICK and PET_IMAGES.get(pet_data['pet_type'] + '_sick'):
         image_key = pet_data['pet_type'] + '_sick'
 
@@ -128,8 +119,7 @@ def get_pet_status_and_image(user_id, pet_data):
     if PET_IMAGES.get(image_key):
         return status_text, PET_IMAGES[image_key]
     else:
-        # Если ни специфичного, ни базового изображения не найдено, возвращаем заглушку или первое попавшееся
-        # Убедимся, что PET_IMAGES не пуст
+        # Fallback to a default image if specific one not found, or None if no images at all
         return status_text, list(PET_IMAGES.values())[0] if PET_IMAGES else None
 
 
@@ -165,7 +155,7 @@ def send_welcome(message):
     bot.send_message(message.chat.id, "Привет! Выберите своего первого питомца:", reply_markup=markup)
     # Отправляем изображения питомцев
     for pet_key, pet_info in PET_TYPES.items():
-        if PET_IMAGES.get(pet_key): # Проверяем наличие базового изображения
+        if PET_IMAGES.get(pet_key):
             try:
                 with open(PET_IMAGES[pet_key], 'rb') as photo:
                     bot.send_photo(message.chat.id, photo, caption=pet_info['name'])
@@ -182,7 +172,7 @@ def show_status(message):
         bot.send_message(message.chat.id, "У вас пока нет питомца. Используйте /start, чтобы завести его!")
         return
 
-    pet_data = db.get_pet(user['id']) # Получаем питомца по owner_id (user['id'])
+    pet_data = db.get_pet(user['id'])
     
     if not pet_data:
         bot.send_message(message.chat.id, "Проблема с данными питомца. Пожалуйста, попробуйте /start снова.")
@@ -242,17 +232,15 @@ def callback_choose_pet(call):
         bot.answer_callback_query(call.id, "Неизвестный тип питомца.")
         return
 
-    # Если питомец мертв или отсутствует, создаем нового
-    pet_name = PET_TYPES[pet_type_key]['name'] # Используем дефолтное имя типа как имя питомца
+    pet_name = PET_TYPES[pet_type_key]['name']
     new_pet = db.create_pet(user['id'], pet_type_key, pet_name)
     
     bot.edit_message_text(chat_id=chat_id, message_id=message_id,
                           text=f"Поздравляем! Вы выбрали питомца: *{pet_name}*!",
                           parse_mode='Markdown', reply_markup=None)
     
-    # Отправляем первое сообщение о состоянии питомца
     status_text, pet_image_path = get_pet_status_and_image(user['id'], new_pet)
-    status_text += f"\n\nБаланс Tamacoin: `{user['balance']}🪙`" # Пока 0
+    status_text += f"\n\nБаланс Tamacoin: `{user['balance']}🪙`"
 
     if pet_image_path:
         try:
@@ -281,34 +269,29 @@ def _perform_pet_action(message, action_type, reward_amount, stat_to_increase, i
         bot.send_message(message.chat.id, "Ваш питомец не активен или мертв. Вы не можете выполнять действия. Используйте /buy_pet, чтобы приобрести нового.")
         return
     
-    pet_data = update_pet_stats(pet_data) # Обновляем состояние питомца перед проверкой и действием
+    pet_data = update_pet_stats(pet_data)
 
     last_action_time_str = pet_data.get(action_type)
     if is_action_on_cooldown(last_action_time_str):
         bot.send_message(message.chat.id, cooldown_message)
         return
 
-    # Выполняем действие
     current_time_iso = get_current_iso_time()
     db.update_pet_action_time(user['id'], action_type, current_time_iso)
 
-    # Увеличиваем соответствующий параметр, но не более 100
     pet_data[stat_to_increase] = min(100.0, pet_data[stat_to_increase] + increase_value)
     
-    # Сохраняем обновленное состояние питомца в БД
     db.update_pet_state(user['id'], pet_data['hunger'], pet_data['happiness'], pet_data['health'], pet_data['last_state_update'])
 
-    # Выдаем награду
-    db.update_user_balance(user_telegram_id, reward_amount) # update_user_balance теперь инкрементирует total_distributed_coins
+    db.update_user_balance(user_telegram_id, reward_amount)
 
     updated_balance = db.get_user(user_telegram_id)['balance']
 
-    # Увеличиваем счетчик действий для приветственного бонуса
     actions_count = db.increment_welcome_bonus_actions(user_telegram_id)
+    # Проверяем user.get('welcome_bonus_actions_count', 0) чтобы убедиться, что бонус не выдавался ранее
     if actions_count >= WELCOME_BONUS_ACTIONS_REQUIRED and user.get('welcome_bonus_actions_count', 0) < WELCOME_BONUS_ACTIONS_REQUIRED:
-        # Проверяем, что бонус еще не был выдан (предыдущее значение было меньше)
         db.update_user_balance(user_telegram_id, WELCOME_BONUS_AMOUNT)
-        db.reset_welcome_bonus_actions(user_telegram_id) # Сбрасываем счетчик
+        db.reset_welcome_bonus_actions(user_telegram_id)
         bot.send_message(message.chat.id,
                          f"🎉 Поздравляем! Вы совершили {WELCOME_BONUS_ACTIONS_REQUIRED} действий и получили приветственный бонус: *{WELCOME_BONUS_AMOUNT} Tamacoin*!",
                          parse_mode='Markdown')
@@ -319,7 +302,7 @@ def _perform_pet_action(message, action_type, reward_amount, stat_to_increase, i
 @bot.message_handler(commands=['feed'])
 def feed_pet(message):
     _perform_pet_action(
-        message, 'last_fed', FEED_REWARD, 'hunger', 20.0, # Увеличивает голод на 20%
+        message, 'last_fed', FEED_REWARD, 'hunger', 20.0,
         "Вы покормили питомца! Он стал более сытым.",
         f"Вы уже кормили питомца менее чем {ACTION_COOLDOWN_HOURS} час назад. Попробуйте позже."
     )
@@ -327,7 +310,7 @@ def feed_pet(message):
 @bot.message_handler(commands=['play'])
 def play_with_pet(message):
     _perform_pet_action(
-        message, 'last_played', PLAY_REWARD, 'happiness', 25.0, # Увеличивает счастье на 25%
+        message, 'last_played', PLAY_REWARD, 'happiness', 25.0,
         "Вы поиграли с питомцем! Он очень счастлив.",
         f"Вы уже играли с питомцем менее чем {ACTION_COOLDOWN_HOURS} час назад. Попробуйте позже."
     )
@@ -335,7 +318,7 @@ def play_with_pet(message):
 @bot.message_handler(commands=['clean'])
 def clean_for_pet(message):
     _perform_pet_action(
-        message, 'last_cleaned', CLEAN_REWARD, 'health', 15.0, # Увеличивает здоровье на 15%
+        message, 'last_cleaned', CLEAN_REWARD, 'health', 15.0,
         "Вы убрали за питомцем! Он стал чище и здоровее.",
         f"Вы уже убирали за питомцем менее чем {ACTION_COOLDOWN_HOURS} час назад. Попробуйте позже."
     )
@@ -430,90 +413,96 @@ def callback_buy_item(call):
         pet_data = update_pet_stats(pet_data) # Обновляем состояние перед применением эффекта
         if item_type == 'food':
             pet_data['hunger'] = min(100.0, pet_data['hunger'] + 30.0) # Еда восстанавливает голод
-            db.update_pet_state(user['id'], pet_data['hunger'], pet_data['happiness'], pet_data['health'], pet_data['last_state_update'])
-            bot.send_message(chat_id, f"Вы купили и использовали Еду. Ваш питомец стал сытнее! Ваш баланс: *{updated_balance} Tamacoin*.", parse_mode='Markdown')
+            bot.answer_callback_query(call.id, f"Вы купили еду! Голод питомца увеличен.")
         elif item_type == 'medicine':
             pet_data['health'] = min(100.0, pet_data['health'] + 40.0) # Лекарство восстанавливает здоровье
-            db.update_pet_state(user['id'], pet_data['hunger'], pet_data['happiness'], pet_data['health'], pet_data['last_state_update'])
-            bot.send_message(chat_id, f"Вы купили и использовали Лекарство. Ваш питомец стал здоровее! Ваш баланс: *{updated_balance} Tamacoin*.", parse_mode='Markdown')
+            bot.answer_callback_query(call.id, f"Вы купили лекарство! Здоровье питомца восстановлено.")
+        
+        db.update_pet_state(user['id'], pet_data['hunger'], pet_data['happiness'], pet_data['health'], pet_data['last_state_update'])
+        
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                              text=f"Вы успешно купили *{item_name}*! Ваш новый баланс: *{updated_balance} Tamacoin*.\n"
+                                   f"Голод: `{pet_data['hunger']:.1f}%`, Здоровье: `{pet_data['health']:.1f}%`",
+                              parse_mode='Markdown', reply_markup=None)
     else:
-        # Если питомец мертв или не существует
-        bot.send_message(chat_id, f"Вы купили *{item_name}* за {cost} Tamacoin. Ваш баланс: *{updated_balance} Tamacoin*. Но ваш питомец неактивен, поэтому предмет не был использован.", parse_mode='Markdown')
-
-    bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                          text=f"Выбранный товар: *{item_name}*. Текущий баланс: *{updated_balance} Tamacoin*.",
-                          parse_mode='Markdown', reply_markup=None)
+        bot.answer_callback_query(call.id, "У вас нет активного питомца, чтобы применить товар.")
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                              text=f"Вы успешно купили *{item_name}*! Ваш новый баланс: *{updated_balance} Tamacoin*.\n"
+                                   f"У вас нет активного питомца, чтобы применить товар. Он останется на вашем счету (хотя пока не реализовано хранение предметов).",
+                              parse_mode='Markdown', reply_markup=None)
 
 @bot.message_handler(commands=['buy_pet'])
-def buy_new_pet_command(message):
-    user = db.get_user(message.from_user.id)
+def buy_new_pet(message):
+    user_telegram_id = message.from_user.id
+    user = db.get_user(user_telegram_id)
+
     if not user:
         bot.send_message(message.chat.id, "Вы еще не зарегистрированы. Используйте /start, чтобы начать игру.")
         return
 
-    user_pet = db.get_pet(user['id'])
-
-    if user_pet and user_pet['is_alive']:
-        bot.send_message(message.chat.id, "У вас уже есть живой питомец! Если хотите завести нового, предыдущий должен умереть.")
+    pet_data = db.get_pet(user['id'])
+    if pet_data and pet_data['is_alive']:
+        bot.send_message(message.chat.id, "У вас уже есть живой питомец! Вы не можете завести нового.")
         return
 
     if user['balance'] < NEW_PET_COST:
-        bot.send_message(message.chat.id, f"Недостаточно Tamacoin для покупки нового питомца. Вам нужно *{NEW_PET_COST} Tamacoin*. Ваш баланс: *{user['balance']}*.", parse_mode='Markdown')
+        bot.send_message(message.chat.id, f"У вас недостаточно Tamacoin для покупки нового питомца. Стоимость: *{NEW_PET_COST} Tamacoin*. Ваш баланс: *{user['balance']}*.", parse_mode='Markdown')
         return
 
-    # Предлагаем выбор питомца после оплаты
     markup = types.InlineKeyboardMarkup(row_width=1)
-    for pet_key, pet_info in PET_TYPES.items():
-        markup.add(types.InlineKeyboardButton(pet_info['name'], callback_data=f'confirm_buy_pet_{pet_key}'))
-    
-    bot.send_message(message.chat.id, f"Вы собираетесь приобрести нового питомца за *{NEW_PET_COST} Tamacoin*. Ваш баланс: *{user['balance']} Tamacoin*.\nВыберите тип питомца:",
+    itembtn1 = types.InlineKeyboardButton(PET_TYPES['toothless']['name'], callback_data='buy_pet_toothless')
+    itembtn2 = types.InlineKeyboardButton(PET_TYPES['light_fury']['name'], callback_data='buy_pet_light_fury')
+    itembtn3 = types.InlineKeyboardButton(PET_TYPES['stormfly']['name'], callback_data='buy_pet_stormfly')
+    markup.add(itembtn1, itembtn2, itembtn3)
+
+    bot.send_message(message.chat.id, f"Выберите нового питомца за {NEW_PET_COST} Tamacoin. Ваш баланс: *{user['balance']} Tamacoin*.",
                      reply_markup=markup, parse_mode='Markdown')
 
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('confirm_buy_pet_'))
-def callback_confirm_buy_pet(call):
+@bot.callback_query_handler(func=lambda call: call.data.startswith('buy_pet_'))
+def callback_buy_new_pet(call):
     chat_id = call.message.chat.id
     user_telegram_id = call.from_user.id
     message_id = call.message.message_id
     
     user = db.get_user(user_telegram_id)
     if not user:
-        bot.answer_callback_query(call.id, "Ошибка пользователя.")
-        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="Ошибка. Попробуйте /start.", reply_markup=None)
+        bot.answer_callback_query(call.id, "Вы не зарегистрированы.")
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                              text="Вы не зарегистрированы. Используйте /start.", reply_markup=None)
         return
 
-    user_pet = db.get_pet(user['id'])
-    if user_pet and user_pet['is_alive']:
+    pet_data = db.get_pet(user['id'])
+    if pet_data and pet_data['is_alive']:
         bot.answer_callback_query(call.id, "У вас уже есть живой питомец!")
         bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                              text="У вас уже есть питомец. Используйте /status.", reply_markup=None)
+                              text="У вас уже есть живой питомец.", reply_markup=None)
         return
 
     if user['balance'] < NEW_PET_COST:
-        bot.answer_callback_query(call.id, "Недостаточно Tamacoin для покупки нового питомца.")
+        bot.answer_callback_query(call.id, "Недостаточно Tamacoin!")
         bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                              text=f"Недостаточно Tamacoin для покупки нового питомца. Вам нужно *{NEW_PET_COST} Tamacoin*. Ваш баланс: *{user['balance']}*.",
+                              text=f"Недостаточно Tamacoin для покупки нового питомца. Ваш баланс: *{user['balance']}*.",
                               parse_mode='Markdown', reply_markup=None)
         return
 
-    pet_type_key = call.data.replace('confirm_buy_pet_', '')
+    pet_type_key = call.data.replace('buy_pet_', '')
     if pet_type_key not in PET_TYPES:
         bot.answer_callback_query(call.id, "Неизвестный тип питомца.")
         return
 
     # Списываем стоимость
     db.update_user_balance(user_telegram_id, -NEW_PET_COST)
-    updated_balance = db.get_user(user_telegram_id)['balance']
 
     # Создаем нового питомца
     pet_name = PET_TYPES[pet_type_key]['name']
     new_pet = db.create_pet(user['id'], pet_type_key, pet_name)
+    
+    updated_balance = db.get_user(user_telegram_id)['balance']
 
     bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                          text=f"Поздравляем! Вы купили нового питомца: *{pet_name}* за {NEW_PET_COST} Tamacoin! Ваш баланс: *{updated_balance} Tamacoin*.",
+                          text=f"Вы успешно купили питомца: *{pet_name}*! Ваш новый баланс: *{updated_balance} Tamacoin*.",
                           parse_mode='Markdown', reply_markup=None)
     
-    # Отправляем первое сообщение о состоянии нового питомца
     status_text, pet_image_path = get_pet_status_and_image(user['id'], new_pet)
     status_text += f"\n\nБаланс Tamacoin: `{updated_balance}🪙`"
 
@@ -525,50 +514,83 @@ def callback_confirm_buy_pet(call):
             bot.send_message(chat_id, status_text + f"\n\n_Изображение питомца не найдено. Проверьте путь: {pet_image_path}_", parse_mode='Markdown')
     else:
         bot.send_message(chat_id, status_text, parse_mode='Markdown')
+    
+    bot.send_message(chat_id, "Начните ухаживать за ним! Помните, что вам нужно совершить 5 действий, чтобы получить приветственный бонус (если вы его ещё не получали).")
 
-    bot.answer_callback_query(call.id, "Питомец куплен!")
 
-
-# --- Административные команды ---
-@bot.message_handler(commands=['admin_stats'])
-def admin_stats(message):
+# --- Административные команды (для админа) ---
+@bot.message_handler(commands=['admin_get_balance'])
+def admin_get_balance(message):
     if message.from_user.id != ADMIN_TELEGRAM_ID:
         bot.send_message(message.chat.id, "У вас нет прав для этой команды.")
         return
     
-    total_users = db.get_total_users()
-    total_pets_alive = db.get_total_users_with_pets()
-    total_tamacoin_distributed = db.get_total_tamacoin_distributed()
+    parts = message.text.split()
+    if len(parts) != 2:
+        bot.send_message(message.chat.id, "Использование: /admin_get_balance <telegram_id_пользователя>")
+        return
     
-    stats_text = (
-        f"*Статистика системы Tamacoin Game:*\n\n"
-        f"Всего зарегистрировано пользователей: *{total_users}*\n"
-        f"Живых питомцев: *{total_pets_alive}*\n"
-        f"Распределено Tamacoin: *{total_tamacoin_distributed} из {TOTAL_INITIAL_SUPPLY}*\n"
-        f"Осталось Tamacoin для распределения: *{TOTAL_INITIAL_SUPPLY - total_tamacoin_distributed}*"
-    )
-    bot.send_message(message.chat.id, stats_text, parse_mode='Markdown')
+    try:
+        target_telegram_id = int(parts[1])
+    except ValueError:
+        bot.send_message(message.chat.id, "ID пользователя должен быть числом.")
+        return
 
-
-# --- Точка входа для вебхуков Render.com ---
-@app.route('/' + BOT_TOKEN, methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
+    user = db.get_user(target_telegram_id)
+    if user:
+        bot.send_message(message.chat.id, f"Баланс пользователя {target_telegram_id}: *{user['balance']} Tamacoin*.", parse_mode='Markdown')
     else:
-        # Для других типов запросов или некорректного content-type
-        return '', 403 # Forbidden
+        bot.send_message(message.chat.id, f"Пользователь с ID {target_telegram_id} не найден.")
 
-
-if __name__ == '__main__':
-    # Инициализация базы данных происходит автоматически при создании объекта db = DBManager() в db_manager.py
-    # Дополнительный вызов db.init_db() не требуется.
+@bot.message_handler(commands=['admin_add_balance'])
+def admin_add_balance(message):
+    if message.from_user.id != ADMIN_TELEGRAM_ID:
+        bot.send_message(message.chat.id, "У вас нет прав для этой команды.")
+        return
     
-    # Запуск Flask-сервера
-    # Render.com предоставляет порт через переменную окружения PORT
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    parts = message.text.split()
+    if len(parts) != 3:
+        bot.send_message(message.chat.id, "Использование: /admin_add_balance <telegram_id_пользователя> <сумма>")
+        return
+    
+    try:
+        target_telegram_id = int(parts[1])
+        amount = int(parts[2])
+    except ValueError:
+        bot.send_message(message.chat.id, "ID пользователя и сумма должны быть числами.")
+        return
+
+    user = db.get_user(target_telegram_id)
+    if user:
+        db.update_user_balance(target_telegram_id, amount)
+        updated_balance = db.get_user(target_telegram_id)['balance']
+        bot.send_message(message.chat.id, f"Пользователю {target_telegram_id} добавлено {amount} Tamacoin. Новый баланс: *{updated_balance} Tamacoin*.", parse_mode='Markdown')
+    else:
+        bot.send_message(message.chat.id, f"Пользователь с ID {target_telegram_id} не найден.")
+
+@bot.message_handler(commands=['admin_total_supply'])
+def admin_total_supply(message):
+    if message.from_user.id != ADMIN_TELEGRAM_ID:
+        bot.send_message(message.chat.id, "У вас нет прав для этой команды.")
+        return
+    
+    total_distributed = db.get_total_distributed_coins()
+    bot.send_message(message.chat.id, f"Общий объем распределенных монет (Total Supply): *{total_distributed}* из *{TOTAL_INITIAL_SUPPLY}*.", parse_mode='Markdown')
+
+
+# --- Вебхук ---
+# Это основной обработчик для Flask, который получает обновления от Telegram
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+def webhook():
+    json_string = request.get_data().decode('utf-8')
+    update = telebot.types.Update.de_json(json_string)
+    bot.process_new_updates([update])
+    return '!', 200 # Возвращаем 200 OK для Telegram
+
+# Запуск Flask-приложения (для вебхуков)
+if __name__ == '__main__':
+    # PORT должен быть установлен в переменных окружения на Render.com
+    # или вы можете указать его явно, например, port=5000
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # print("Bot is running via webhook...") # Эта строка не будет выполнена, пока работает app.run()
 
