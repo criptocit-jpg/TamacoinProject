@@ -109,7 +109,7 @@ def get_pet_status_and_image(user_id, pet_data):
        pet_data['happiness'] < HAPPINESS_THRESHOLD_SAD or \
        pet_data['health'] < HEALTH_THRESHOLD_SICK:
         
-        if PET_IMAGES.get(pet_data['pet_type'] + '_hungry'): # Предполагаем, что 'hungry' может быть общим для всех плохих состояний
+        if PET_IMAGES.get(pet_data['pet_type'] + '_hungry'):
             image_key = pet_data['pet_type'] + '_hungry'
 
     if pet_data['health'] < HEALTH_THRESHOLD_SICK and PET_IMAGES.get(pet_data['pet_type'] + '_sick'):
@@ -119,7 +119,6 @@ def get_pet_status_and_image(user_id, pet_data):
     if PET_IMAGES.get(image_key):
         return status_text, PET_IMAGES[image_key]
     else:
-        # Fallback to a default image if specific one not found, or None if no images at all
         return status_text, list(PET_IMAGES.values())[0] if PET_IMAGES else None
 
 
@@ -210,49 +209,72 @@ def send_users_count(message):
 # --- Обработчик инлайн-кнопок ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith('choose_pet_'))
 def callback_choose_pet(call):
+    print(f"DEBUG: callback_choose_pet called for user {call.from_user.id} with data '{call.data}'")
     chat_id = call.message.chat.id
     user_telegram_id = call.from_user.id
     message_id = call.message.message_id
     
-    user = db.get_user(user_telegram_id)
-    if not user:
-        user = db.create_user(user_telegram_id, call.from_user.username)
+    try:
+        user = db.get_user(user_telegram_id)
+        print(f"DEBUG: User data retrieved: {user}")
+        if not user:
+            user = db.create_user(user_telegram_id, call.from_user.username)
+            print(f"DEBUG: User created: {user}")
 
-    user_pet = db.get_pet(user['id'])
+        user_pet = db.get_pet(user['id'])
+        print(f"DEBUG: Pet data retrieved: {user_pet}")
 
-    if user_pet and user_pet['is_alive']:
-        bot.answer_callback_query(call.id, "У вас уже есть живой питомец!")
+        if user_pet and user_pet['is_alive']:
+            bot.answer_callback_query(call.id, "У вас уже есть живой питомец!")
+            bot.edit_message_text(chat_id=chat_id, message_id=message_id,
+                                  text="У вас уже есть питомец. Используйте /status для проверки его состояния.",
+                                  reply_markup=None)
+            print("DEBUG: Already has a pet, returning.")
+            return
+
+        pet_type_key = call.data.replace('choose_pet_', '')
+        print(f"DEBUG: Pet type key: {pet_type_key}")
+        if pet_type_key not in PET_TYPES:
+            bot.answer_callback_query(call.id, "Неизвестный тип питомца.")
+            print("DEBUG: Unknown pet type, returning.")
+            return
+
+        # Если питомец мертв или отсутствует, создаем нового
+        pet_name = PET_TYPES[pet_type_key]['name'] # Используем дефолтное имя типа как имя питомца
+        new_pet = db.create_pet(user['id'], pet_type_key, pet_name)
+        print(f"DEBUG: New pet created: {new_pet}")
+        
         bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                              text="У вас уже есть питомец. Используйте /status для проверки его состояния.",
-                              reply_markup=None)
+                              text=f"Поздравляем! Вы выбрали питомца: *{pet_name}*!",
+                              parse_mode='Markdown', reply_markup=None)
+        
+        # Отправляем первое сообщение о состоянии питомца
+        status_text, pet_image_path = get_pet_status_and_image(user['id'], new_pet)
+        status_text += f"\n\nБаланс Tamacoin: `{user['balance']}🪙`" # Пока 0
+
+        if pet_image_path:
+            try:
+                with open(pet_image_path, 'rb') as photo:
+                    bot.send_photo(chat_id, photo, caption=status_text, parse_mode='Markdown')
+            except FileNotFoundError:
+                bot.send_message(chat_id, status_text + f"\n\n_Изображение питомца не найдено. Проверьте путь: {pet_image_path}_", parse_mode='Markdown')
+        else:
+            bot.send_message(chat_id, status_text, parse_mode='Markdown')
+        
+        bot.send_message(chat_id, "Теперь начните ухаживать за ним! Помните, что вам нужно совершить 5 действий, чтобы получить приветственный бонус.")
+        # Важно: answer_callback_query должна быть вызвана в любом случае, чтобы закрыть индикатор загрузки кнопки
+        # Если вы уже вызывали ее ранее для ошибок, то здесь она не нужна.
+        # В данном случае, если все успешно, бот редактирует сообщение, и этого может быть достаточно.
+        # Однако, для гарантии, если сообщение не редактируется, и нет всплывающего окна, можно добавить:
+        bot.answer_callback_query(call.id, "Питомец выбран!") # Добавил для уверенности
+
+    except Exception as e:
+        print(f"ERROR: An unhandled exception occurred in callback_choose_pet: {e}")
+        import traceback
+        traceback.print_exc() # Выведет полный стек вызовов в логи
+        bot.answer_callback_query(call.id, "Произошла внутренняя ошибка. Попробуйте позже.")
+        bot.send_message(chat_id, f"Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте снова. Ошибка: `{e}`", parse_mode='Markdown')
         return
-
-    pet_type_key = call.data.replace('choose_pet_', '')
-    if pet_type_key not in PET_TYPES:
-        bot.answer_callback_query(call.id, "Неизвестный тип питомца.")
-        return
-
-    pet_name = PET_TYPES[pet_type_key]['name']
-    new_pet = db.create_pet(user['id'], pet_type_key, pet_name)
-    
-    bot.edit_message_text(chat_id=chat_id, message_id=message_id,
-                          text=f"Поздравляем! Вы выбрали питомца: *{pet_name}*!",
-                          parse_mode='Markdown', reply_markup=None)
-    
-    status_text, pet_image_path = get_pet_status_and_image(user['id'], new_pet)
-    status_text += f"\n\nБаланс Tamacoin: `{user['balance']}🪙`"
-
-    if pet_image_path:
-        try:
-            with open(pet_image_path, 'rb') as photo:
-                bot.send_photo(chat_id, photo, caption=status_text, parse_mode='Markdown')
-        except FileNotFoundError:
-            bot.send_message(chat_id, status_text + f"\n\n_Изображение питомца не найдено. Проверьте путь: {pet_image_path}_", parse_mode='Markdown')
-    else:
-        bot.send_message(chat_id, status_text, parse_mode='Markdown')
-    
-    bot.send_message(chat_id, "Теперь начните ухаживать за ним! Помните, что вам нужно совершить 5 действий, чтобы получить приветственный бонус.")
-
 
 # --- Команды для взаимодействия с питомцем ---
 
@@ -288,7 +310,6 @@ def _perform_pet_action(message, action_type, reward_amount, stat_to_increase, i
     updated_balance = db.get_user(user_telegram_id)['balance']
 
     actions_count = db.increment_welcome_bonus_actions(user_telegram_id)
-    # Проверяем user.get('welcome_bonus_actions_count', 0) чтобы убедиться, что бонус не выдавался ранее
     if actions_count >= WELCOME_BONUS_ACTIONS_REQUIRED and user.get('welcome_bonus_actions_count', 0) < WELCOME_BONUS_ACTIONS_REQUIRED:
         db.update_user_balance(user_telegram_id, WELCOME_BONUS_AMOUNT)
         db.reset_welcome_bonus_actions(user_telegram_id)
@@ -410,12 +431,12 @@ def callback_buy_item(call):
     # Применяем эффект на питомца (если жив)
     pet_data = db.get_pet(user['id'])
     if pet_data and pet_data['is_alive']:
-        pet_data = update_pet_stats(pet_data) # Обновляем состояние перед применением эффекта
+        pet_data = update_pet_stats(pet_data)
         if item_type == 'food':
-            pet_data['hunger'] = min(100.0, pet_data['hunger'] + 30.0) # Еда восстанавливает голод
+            pet_data['hunger'] = min(100.0, pet_data['hunger'] + 30.0)
             bot.answer_callback_query(call.id, f"Вы купили еду! Голод питомца увеличен.")
         elif item_type == 'medicine':
-            pet_data['health'] = min(100.0, pet_data['health'] + 40.0) # Лекарство восстанавливает здоровье
+            pet_data['health'] = min(100.0, pet_data['health'] + 40.0)
             bot.answer_callback_query(call.id, f"Вы купили лекарство! Здоровье питомца восстановлено.")
         
         db.update_pet_state(user['id'], pet_data['hunger'], pet_data['happiness'], pet_data['health'], pet_data['last_state_update'])
@@ -589,8 +610,5 @@ def webhook():
 
 # Запуск Flask-приложения (для вебхуков)
 if __name__ == '__main__':
-    # PORT должен быть установлен в переменных окружения на Render.com
-    # или вы можете указать его явно, например, port=5000
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-    # print("Bot is running via webhook...") # Эта строка не будет выполнена, пока работает app.run()
 
