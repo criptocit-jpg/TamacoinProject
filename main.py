@@ -205,8 +205,15 @@ def send_users_count(message):
     count = db.get_total_users_with_pets()
     bot.send_message(message.chat.id, f"Общее количество живых питомцев: *{count}*.", parse_mode='Markdown')
 
+# --- Временный общий обработчик колбэков для отладки (ПЕРВЫЙ ОБРАБОТЧИК ДЛЯ CALLBACK_QUERY) ---
+@bot.callback_query_handler(func=lambda call: True)
+def debug_all_callbacks(call):
+    print(f"DEBUG_ALL_CALLBACKS: Received callback_data: '{call.data}' from user {call.from_user.id}")
+    # Важно: НЕ вызывайте bot.answer_callback_query здесь, чтобы не перехватывать ее у других обработчиков
+    # и не мешать их работе. Этот обработчик должен быть временным и удален после отладки.
 
-# --- Обработчик инлайн-кнопок ---
+
+# --- Обработчик инлайн-кнопок ВЫБОРА ПИТОМЦА ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith('choose_pet_'))
 def callback_choose_pet(call):
     print(f"DEBUG: callback_choose_pet called for user {call.from_user.id} with data '{call.data}'")
@@ -262,11 +269,8 @@ def callback_choose_pet(call):
             bot.send_message(chat_id, status_text, parse_mode='Markdown')
         
         bot.send_message(chat_id, "Теперь начните ухаживать за ним! Помните, что вам нужно совершить 5 действий, чтобы получить приветственный бонус.")
-        # Важно: answer_callback_query должна быть вызвана в любом случае, чтобы закрыть индикатор загрузки кнопки
-        # Если вы уже вызывали ее ранее для ошибок, то здесь она не нужна.
-        # В данном случае, если все успешно, бот редактирует сообщение, и этого может быть достаточно.
-        # Однако, для гарантии, если сообщение не редактируется, и нет всплывающего окна, можно добавить:
-        bot.answer_callback_query(call.id, "Питомец выбран!") # Добавил для уверенности
+        
+        bot.answer_callback_query(call.id, "Питомец выбран!") # Добавил для уверенности, чтобы закрыть индикатор загрузки кнопки
 
     except Exception as e:
         print(f"ERROR: An unhandled exception occurred in callback_choose_pet: {e}")
@@ -276,120 +280,7 @@ def callback_choose_pet(call):
         bot.send_message(chat_id, f"Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте снова. Ошибка: `{e}`", parse_mode='Markdown')
         return
 
-# --- Команды для взаимодействия с питомцем ---
-
-def _perform_pet_action(message, action_type, reward_amount, stat_to_increase, increase_value, success_message, cooldown_message):
-    user_telegram_id = message.from_user.id
-    user = db.get_user(user_telegram_id)
-
-    if not user or not user['pet_id']:
-        bot.send_message(message.chat.id, "У вас пока нет питомца. Используйте /start, чтобы завести его!")
-        return
-
-    pet_data = db.get_pet(user['id'])
-    if not pet_data or not pet_data['is_alive']:
-        bot.send_message(message.chat.id, "Ваш питомец не активен или мертв. Вы не можете выполнять действия. Используйте /buy_pet, чтобы приобрести нового.")
-        return
-    
-    pet_data = update_pet_stats(pet_data)
-
-    last_action_time_str = pet_data.get(action_type)
-    if is_action_on_cooldown(last_action_time_str):
-        bot.send_message(message.chat.id, cooldown_message)
-        return
-
-    current_time_iso = get_current_iso_time()
-    db.update_pet_action_time(user['id'], action_type, current_time_iso)
-
-    pet_data[stat_to_increase] = min(100.0, pet_data[stat_to_increase] + increase_value)
-    
-    db.update_pet_state(user['id'], pet_data['hunger'], pet_data['happiness'], pet_data['health'], pet_data['last_state_update'])
-
-    db.update_user_balance(user_telegram_id, reward_amount)
-
-    updated_balance = db.get_user(user_telegram_id)['balance']
-
-    actions_count = db.increment_welcome_bonus_actions(user_telegram_id)
-    if actions_count >= WELCOME_BONUS_ACTIONS_REQUIRED and user.get('welcome_bonus_actions_count', 0) < WELCOME_BONUS_ACTIONS_REQUIRED:
-        db.update_user_balance(user_telegram_id, WELCOME_BONUS_AMOUNT)
-        db.reset_welcome_bonus_actions(user_telegram_id)
-        bot.send_message(message.chat.id,
-                         f"🎉 Поздравляем! Вы совершили {WELCOME_BONUS_ACTIONS_REQUIRED} действий и получили приветственный бонус: *{WELCOME_BONUS_AMOUNT} Tamacoin*!",
-                         parse_mode='Markdown')
-    
-    bot.send_message(message.chat.id, f"{success_message} Ваш баланс: *{updated_balance} Tamacoin*.", parse_mode='Markdown')
-
-
-@bot.message_handler(commands=['feed'])
-def feed_pet(message):
-    _perform_pet_action(
-        message, 'last_fed', FEED_REWARD, 'hunger', 20.0,
-        "Вы покормили питомца! Он стал более сытым.",
-        f"Вы уже кормили питомца менее чем {ACTION_COOLDOWN_HOURS} час назад. Попробуйте позже."
-    )
-
-@bot.message_handler(commands=['play'])
-def play_with_pet(message):
-    _perform_pet_action(
-        message, 'last_played', PLAY_REWARD, 'happiness', 25.0,
-        "Вы поиграли с питомцем! Он очень счастлив.",
-        f"Вы уже играли с питомцем менее чем {ACTION_COOLDOWN_HOURS} час назад. Попробуйте позже."
-    )
-
-@bot.message_handler(commands=['clean'])
-def clean_for_pet(message):
-    _perform_pet_action(
-        message, 'last_cleaned', CLEAN_REWARD, 'health', 15.0,
-        "Вы убрали за питомцем! Он стал чище и здоровее.",
-        f"Вы уже убирали за питомцем менее чем {ACTION_COOLDOWN_HOURS} час назад. Попробуйте позже."
-    )
-
-
-@bot.message_handler(commands=['daily_bonus'])
-def get_daily_bonus(message):
-    user_telegram_id = message.from_user.id
-    user = db.get_user(user_telegram_id)
-
-    if not user:
-        bot.send_message(message.chat.id, "Вы еще не зарегистрированы. Используйте /start, чтобы начать игру.")
-        return
-
-    last_bonus_time_str = user.get('last_daily_bonus')
-    current_time = datetime.datetime.now(datetime.timezone.utc)
-
-    if last_bonus_time_str:
-        last_bonus_time = parse_iso_time(last_bonus_time_str)
-        time_diff_hours = (current_time - last_bonus_time).total_seconds() / 3600
-        if time_diff_hours < DAILY_BONUS_INTERVAL_HOURS:
-            remaining_time_seconds = (DAILY_BONUS_INTERVAL_HOURS * 3600) - (current_time - last_bonus_time).total_seconds()
-            hours = int(remaining_time_seconds // 3600)
-            minutes = int((remaining_time_seconds % 3600) // 60)
-            bot.send_message(message.chat.id, f"Ежедневный бонус будет доступен через {hours} ч {minutes} мин.")
-            return
-
-    db.update_user_balance(user_telegram_id, DAILY_BONUS_AMOUNT)
-    db.update_last_daily_bonus(user_telegram_id, get_current_iso_time())
-    updated_balance = db.get_user(user_telegram_id)['balance']
-    bot.send_message(message.chat.id,
-                     f"Вы получили ежедневный бонус: *{DAILY_BONUS_AMOUNT} Tamacoin*! Ваш баланс: *{updated_balance} Tamacoin*.",
-                     parse_mode='Markdown')
-
-# --- Магазин и покупка нового питомца ---
-@bot.message_handler(commands=['shop'])
-def show_shop(message):
-    user = db.get_user(message.from_user.id)
-    if not user:
-        bot.send_message(message.chat.id, "Вы еще не зарегистрированы. Используйте /start, чтобы начать игру.")
-        return
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    item_food = types.InlineKeyboardButton(f"Купить Еду ({FOOD_COST}🪙)", callback_data='buy_item_food')
-    item_medicine = types.InlineKeyboardButton(f"Купить Лекарство ({MEDICINE_COST}🪙)", callback_data='buy_item_medicine')
-    markup.add(item_food, item_medicine)
-
-    bot.send_message(message.chat.id, f"Добро пожаловать в магазин! Ваш баланс: *{user['balance']} Tamacoin*.\nЧто хотите купить?",
-                     reply_markup=markup, parse_mode='Markdown')
-
+# --- Обработчик инлайн-кнопок МАГАЗИНА ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith('buy_item_'))
 def callback_buy_item(call):
     chat_id = call.message.chat.id
@@ -611,4 +502,3 @@ def webhook():
 # Запуск Flask-приложения (для вебхуков)
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
