@@ -1,7 +1,7 @@
 # main.py
 
 import os
-import sys # ЭТОТ ИМПОРТ ДОЛЖЕН БЫТЬ ЗДЕСЬ, В САМОМ НАЧАЛЕ СПИСКА ИМПОРТОВ
+import sys
 import telebot
 from telebot import types
 import datetime
@@ -42,8 +42,15 @@ def get_pet_status_and_image(pet):
     elif pet['hunger'] < HUNGER_THRESHOLD_SAD:
         image_key = pet['pet_type'] + '_hungry'
         status_text += "\n*Питомец голоден!*"
+    elif pet['happiness'] < HAPPINESS_THRESHOLD_SAD:
+        image_key = pet['pet_type'] + '_sad' # Если есть картинка для грустного
+        status_text += "\n*Питомец грустит!*"
+    elif pet['health'] < HEALTH_THRESHOLD_SICK:
+        image_key = pet['pet_type'] + '_sick' # Если есть картинка для больного
+        status_text += "\n*Питомец болен!*"
 
-    image_path = PET_IMAGES.get(image_key, PET_IMAGES.get(pet['pet_type'] + '_normal', 'dead_pet'))
+    # Используем .get() с запасным вариантом, чтобы избежать KeyError
+    image_path = PET_IMAGES.get(image_key, PET_IMAGES.get(pet['pet_type'] + '_normal', PET_IMAGES['dead_pet']))
     sys.stderr.write(f"DEBUG_HELPER: Image path determined: {image_path} for key {image_key}.\n")
     return status_text, image_path
 
@@ -56,6 +63,7 @@ def update_pet_stats_over_time(pet):
     last_update_time_str = pet.get('last_state_update')
     if not last_update_time_str:
         sys.stderr.write(f"DEBUG_HELPER: last_state_update missing for pet {pet['id']}, initializing.\n")
+        # Убедитесь, что `pet` обновляется из базы после первого сохранения
         db.update_pet_state(pet['owner_id'], pet['hunger'], pet['happiness'], pet['health'], datetime.datetime.now(datetime.timezone.utc).isoformat())
         pet = db.get_pet(pet['owner_id'])
         last_update_time_str = pet['last_state_update']
@@ -66,7 +74,7 @@ def update_pet_stats_over_time(pet):
         sys.stderr.write(f"ERROR_HELPER: Invalid last_state_update format '{last_update_time_str}' for pet {pet['id']}. Using current time.\n")
         last_update_time = datetime.datetime.now(datetime.timezone.utc)
         db.update_pet_state(pet['owner_id'], pet['hunger'], pet['happiness'], pet['health'], last_update_time.isoformat())
-        pet = db.get_pet(pet['owner_id'])
+        pet = db.get_pet(pet['owner_id']) # Снова получаем обновленные данные
 
     current_time = datetime.datetime.now(datetime.timezone.utc)
     time_elapsed = (current_time - last_update_time).total_seconds() / 3600
@@ -90,6 +98,7 @@ def update_pet_stats_over_time(pet):
 
     new_health = max(0.0, pet['health'] - (HEALTH_DECAY_PER_HOUR * time_elapsed * health_decay_multiplier))
 
+    # Проверка на смерть
     if new_hunger <= 0 or new_happiness <= 0 or new_health <= 0:
         db.kill_pet(pet['owner_id'])
         pet['is_alive'] = 0
@@ -109,6 +118,9 @@ def update_pet_stats_over_time(pet):
 @bot.callback_query_handler(func=lambda call: True)
 def debug_all_callbacks(call):
     sys.stderr.write(f"DEBUG_ALL_CALLBACKS: Received callback_data: '{call.data}' from user {call.from_user.id}\n")
+    # Важно: всегда отвечайте на callback_query, иначе кнопка будет выглядеть "висящей"
+    bot.answer_callback_query(call.id, "Обработка запроса...")
+
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -139,37 +151,39 @@ def send_welcome(message):
             pet = db.get_pet(user['id'])
             if pet:
                 sys.stderr.write(f"DEBUG: User {user_telegram_id} has pet {pet['id']}. Updating pet stats over time.\n")
-                pet = update_pet_stats_over_time(pet)
-                
+                pet = update_pet_stats_over_time(pet) # Обновляем состояние питомца
+
                 status_text, image_path = get_pet_status_and_image(pet)
-                
+
                 if pet['is_alive'] == 0:
                     bot.send_message(chat_id, f"Привет снова, {user['username']}! Ваш баланс: {user['balance']} Tamacoin.")
                     bot.send_message(chat_id, f"Ваш питомец {pet['name']} мертв. 😢\n"
                                                f"Вы можете приобрести нового питомца за {NEW_PET_COST} Tamacoin, используя команду /new_pet (если она у вас есть) или нажав /start еще раз.")
                     try:
+                        # Убедитесь, что PET_IMAGES['dead_pet'] содержит правильный путь
                         with open(PET_IMAGES['dead_pet'], 'rb') as photo:
                             bot.send_photo(chat_id, photo, caption="Покойся с миром, друг.")
                         sys.stderr.write(f"DEBUG: Sent dead pet photo for user {user_telegram_id}.\n")
                     except FileNotFoundError:
-                        bot.send_message(chat_id, "Изображение могилы не найдено.")
+                        bot.send_message(chat_id, "Изображение могилы не найдено. Проверьте путь в pet_config.py.")
                         sys.stderr.write(f"ERROR: Image not found at {PET_IMAGES['dead_pet']} for user {user_telegram_id}.\n")
                     except Exception as e:
                         bot.send_message(chat_id, f"Произошла ошибка при отправке фото. Ваш статус:\n{status_text}")
                         sys.stderr.write(f"ERROR: Failed to send dead pet photo for user {user_telegram_id}: {e}\n")
                         import traceback
                         sys.stderr.write(traceback.format_exc())
+                    return # Важно выйти после обработки мертвого питомца
 
-                    return
-
+                # Если питомец жив
                 bot.send_message(chat_id, f"Привет снова, {user['username']}! Ваш баланс: {user['balance']} Tamacoin.")
-                
+
                 try:
+                    # Убедитесь, что image_path содержит правильный путь
                     with open(image_path, 'rb') as photo:
                         bot.send_photo(chat_id, photo, caption=status_text)
                     sys.stderr.write(f"DEBUG: Sent pet status photo for existing user {user_telegram_id}.\n")
                 except FileNotFoundError:
-                    bot.send_message(chat_id, f"Ой, не могу найти изображение для питомца. Ваш статус:\n{status_text}")
+                    bot.send_message(chat_id, f"Ой, не могу найти изображение для питомца. Ваш статус:\n{status_text}\nПроверьте путь к изображению.")
                     sys.stderr.write(f"ERROR: Image not found at {image_path} for user {user_telegram_id}.\n")
                 except Exception as e:
                     bot.send_message(chat_id, f"Произошла ошибка при отправке фото. Ваш статус:\n{status_text}")
@@ -201,11 +215,14 @@ def callback_choose_pet(call):
     try:
         user = db.get_user(user_telegram_id)
         if not user:
-            sys.stderr.write(f"ERROR: User {user_telegram_id} not found in DB during callback_choose_pet. This shouldn't happen after /start. Creating user.\n")
+            # Это может произойти, если пользователь удалил бота и начал снова,
+            # но callback пришел до того, как /start завершил создание пользователя.
+            # Попробуем создать пользователя еще раз, или проинформируем.
+            sys.stderr.write(f"ERROR: User {user_telegram_id} not found in DB during callback_choose_pet. Attempting re-creation.\n")
             username = call.from_user.username if call.from_user.username else f"id{user_telegram_id}"
             user = db.create_user(user_telegram_id, username)
             if not user:
-                bot.answer_callback_query(call.id, "Не удалось создать пользователя. Попробуйте еще раз.")
+                bot.answer_callback_query(call.id, "Не удалось создать пользователя. Попробуйте начать сначала командой /start.")
                 sys.stderr.write(f"ERROR: Failed to create user {user_telegram_id} even after retry in callback_choose_pet.\n")
                 return
 
@@ -237,7 +254,7 @@ def callback_choose_pet(call):
                     bot.send_photo(chat_id, photo, caption=f"Поздравляем, вы завели {pet_name}!\n\n{status_text}")
                 sys.stderr.write(f"DEBUG: Sent new pet photo to user {user_telegram_id}.\n")
             except FileNotFoundError:
-                bot.send_message(chat_id, f"Поздравляем, вы завели {pet_name}!\n\nОй, не могу найти изображение для питомца. Ваш статус:\n{status_text}")
+                bot.send_message(chat_id, f"Поздравляем, вы завели {pet_name}!\n\nОй, не могу найти изображение для питомца. Ваш статус:\n{status_text}\nПроверьте путь к изображению.")
                 sys.stderr.write(f"ERROR: Image not found at {image_path} for new pet of user {user_telegram_id}.\n")
             except Exception as e:
                 bot.send_message(chat_id, f"Поздравляем, вы завели {pet_name}!\n\nПроизошла ошибка при отправке фото. Ваш статус:\n{status_text}")
@@ -246,10 +263,12 @@ def callback_choose_pet(call):
                 sys.stderr.write(traceback.format_exc())
 
             try:
+                # Удаляем кнопки выбора питомца после выбора
                 bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None) 
                 sys.stderr.write(f"DEBUG: Pet selection buttons removed for user {user_telegram_id}.\n")
             except Exception as e:
                 sys.stderr.write(f"ERROR: Failed to edit message reply markup for user {user_telegram_id}: {e}\n")
+                # Это может произойти, если сообщение уже было изменено или слишком старое. Можно проигнорировать.
                 pass
 
             bot.send_message(chat_id, "Теперь вы можете ухаживать за своим питомцем, используя команды, такие как /feed, /play, /clean и т.д.")
@@ -305,7 +324,7 @@ def send_status(message):
                 bot.send_photo(chat_id, photo, caption=f"{user_balance_text}\n\n{status_text}")
             sys.stderr.write(f"DEBUG: Sent pet status photo for user {user_telegram_id} via /status.\n")
         except FileNotFoundError:
-            bot.send_message(chat_id, f"{user_balance_text}\n\nОй, не могу найти изображение для питомца. Ваш статус:\n{status_text}")
+            bot.send_message(chat_id, f"{user_balance_text}\n\nОй, не могу найти изображение для питомца. Ваш статус:\n{status_text}\nПроверьте путь к изображению.")
             sys.stderr.write(f"ERROR: Image not found at {image_path} for user {user_telegram_id} via /status.\n")
         except Exception as e:
             bot.send_message(chat_id, f"{user_balance_text}\n\nПроизошла ошибка при отправке фото. Ваш статус:\n{status_text}")
@@ -319,44 +338,145 @@ def send_status(message):
         sys.stderr.write(traceback.format_exc())
         bot.send_message(chat_id, "Произошла непредвиденная ошибка при получении статуса. Пожалуйста, попробуйте позже.")
 
-# --- Добавьте другие обработчики здесь ---
-# Если у вас есть другие команды, такие как /feed, /play, /clean, /shop, /daily_bonus,
-# /users_count, /admin_stats и т.д., ВСТАВЬТЕ ИХ СЮДА.
-# Пример:
-# @bot.message_handler(commands=['feed'])
-# def feed_pet_command(message):
-#     # ... ваш код для /feed ...
-#     pass
 
-# @bot.message_handler(commands=['play'])
-# def play_pet_command(message):
-#     # ... ваш код для /play ...
-#     pass
+# --- Добавленные обработчики-заглушки для других команд ---
 
-# @bot.message_handler(commands=['clean'])
-# def clean_pet_command(message):
-#     # ... ваш код для /clean ...
-#     pass
+@bot.message_handler(commands=['feed'])
+def feed_pet_command(message):
+    sys.stderr.write(f"DEBUG: /feed command received from user {message.from_user.id}\n")
+    chat_id = message.chat.id
+    user_telegram_id = message.from_user.id
+    user = db.get_user(user_telegram_id)
 
-# @bot.message_handler(commands=['shop'])
-# def open_shop(message):
-#     # ... ваш код для /shop ...
-#     pass
+    if not user:
+        bot.send_message(chat_id, "Вы еще не начали игру! Используйте команду /start.")
+        return
+    
+    pet = db.get_pet(user['id'])
+    if not pet:
+        bot.send_message(chat_id, "У вас еще нет питомца! Выберите его, используя команду /start.")
+        return
+    
+    if pet['is_alive'] == 0:
+        bot.send_message(chat_id, "Ваш питомец мертв. Вы не можете с ним взаимодействовать.")
+        return
+    
+    # Placeholder: Здесь будет логика кормления
+    bot.send_message(chat_id, "Вы покормили своего питомца! (Логика кормления пока не реализована полностью)")
+    sys.stderr.write(f"DEBUG: User {user_telegram_id} sent /feed.\n")
 
-# @bot.message_handler(commands=['daily_bonus'])
-# def get_daily_bonus(message):
-#     # ... ваш код для /daily_bonus ...
-#     pass
+@bot.message_handler(commands=['play'])
+def play_pet_command(message):
+    sys.stderr.write(f"DEBUG: /play command received from user {message.from_user.id}\n")
+    chat_id = message.chat.id
+    user_telegram_id = message.from_user.id
+    user = db.get_user(user_telegram_id)
 
-# @bot.message_handler(commands=['users_count'])
-# def get_users_count(message):
-#     # ... ваш код для /users_count ...
-#     pass
+    if not user:
+        bot.send_message(chat_id, "Вы еще не начали игру! Используйте команду /start.")
+        return
+    
+    pet = db.get_pet(user['id'])
+    if not pet:
+        bot.send_message(chat_id, "У вас еще нет питомца! Выберите его, используя команду /start.")
+        return
+    
+    if pet['is_alive'] == 0:
+        bot.send_message(chat_id, "Ваш питомец мертв. Вы не можете с ним взаимодействовать.")
+        return
 
-# @bot.message_handler(commands=['admin_stats'])
-# def admin_stats(message):
-#     # ... ваш код для /admin_stats ...
-#     pass
+    # Placeholder: Здесь будет логика игры
+    bot.send_message(chat_id, "Вы поиграли со своим питомцем! (Логика игры пока не реализована полностью)")
+    sys.stderr.write(f"DEBUG: User {user_telegram_id} sent /play.\n")
+
+@bot.message_handler(commands=['clean'])
+def clean_pet_command(message):
+    sys.stderr.write(f"DEBUG: /clean command received from user {message.from_user.id}\n")
+    chat_id = message.chat.id
+    user_telegram_id = message.from_user.id
+    user = db.get_user(user_telegram_id)
+
+    if not user:
+        bot.send_message(chat_id, "Вы еще не начали игру! Используйте команду /start.")
+        return
+    
+    pet = db.get_pet(user['id'])
+    if not pet:
+        bot.send_message(chat_id, "У вас еще нет питомца! Выберите его, используя команду /start.")
+        return
+    
+    if pet['is_alive'] == 0:
+        bot.send_message(chat_id, "Ваш питомец мертв. Вы не можете с ним взаимодействовать.")
+        return
+
+    # Placeholder: Здесь будет логика уборки
+    bot.send_message(chat_id, "Вы убрали за своим питомцем! (Логика уборки пока не реализована полностью)")
+    sys.stderr.write(f"DEBUG: User {user_telegram_id} sent /clean.\n")
+
+@bot.message_handler(commands=['shop'])
+def open_shop(message):
+    sys.stderr.write(f"DEBUG: /shop command received from user {message.from_user.id}\n")
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "Магазин пока закрыт на реконструкцию. Заходите позже!")
+    sys.stderr.write(f"DEBUG: User {message.from_user.id} sent /shop.\n")
+
+@bot.message_handler(commands=['daily_bonus'])
+def get_daily_bonus(message):
+    sys.stderr.write(f"DEBUG: /daily_bonus command received from user {message.from_user.id}\n")
+    chat_id = message.chat.id
+    user_telegram_id = message.from_user.id
+    user = db.get_user(user_telegram_id)
+
+    if not user:
+        bot.send_message(chat_id, "Вы еще не начали игру! Используйте команду /start.")
+        return
+
+    # Placeholder: Здесь будет логика ежедневного бонуса
+    bot.send_message(chat_id, "Ежедневный бонус будет доступен скоро! (Логика пока не реализована)")
+    sys.stderr.write(f"DEBUG: User {user_telegram_id} sent /daily_bonus.\n")
+
+@bot.message_handler(commands=['users_count'])
+def get_users_count(message):
+    sys.stderr.write(f"DEBUG: /users_count command received from user {message.from_user.id}\n")
+    chat_id = message.chat.id
+    try:
+        count = db.get_total_users_count()
+        bot.send_message(chat_id, f"Общее количество пользователей: {count}.")
+        sys.stderr.write(f"DEBUG: Sent users count to user {message.from_user.id}.\n")
+    except Exception as e:
+        sys.stderr.write(f"ERROR: Failed to get users count for user {message.from_user.id}: {e}\n")
+        bot.send_message(chat_id, "Не удалось получить количество пользователей.")
+
+@bot.message_handler(commands=['admin_stats'])
+def admin_stats(message):
+    sys.stderr.write(f"DEBUG: /admin_stats command received from user {message.from_user.id}\n")
+    chat_id = message.chat.id
+    user_telegram_id = message.from_user.id
+
+    if user_telegram_id != ADMIN_TELEGRAM_ID:
+        bot.send_message(chat_id, "У вас нет прав для выполнения этой команды.")
+        sys.stderr.write(f"WARNING: Non-admin user {user_telegram_id} attempted /admin_stats.\n")
+        return
+    
+    try:
+        stats = db.get_game_stats()
+        if stats:
+            response = (
+                f"📊 *Административная статистика:*\n"
+                f"Всего Tamacoin в обращении: `{stats['total_tamacoins_circulating']:.2f}`\n"
+                f"Всего создано питомцев: `{stats['total_pets_created']}`\n"
+                f"Последнее обновление: `{stats['last_update']}`"
+            )
+            bot.send_message(chat_id, response, parse_mode='Markdown')
+            sys.stderr.write(f"DEBUG: Sent admin stats to admin {user_telegram_id}.\n")
+        else:
+            bot.send_message(chat_id, "Статистика игры не найдена.")
+            sys.stderr.write(f"ERROR: Game stats not found for admin {user_telegram_id}.\n")
+    except Exception as e:
+        sys.stderr.write(f"ERROR: Failed to get admin stats for user {user_telegram_id}: {e}\n")
+        import traceback
+        sys.stderr.write(traceback.format_exc())
+        bot.send_message(chat_id, "Произошла ошибка при получении административной статистики.")
 
 
 @app.route(f'/{API_TOKEN}', methods=['POST'])
