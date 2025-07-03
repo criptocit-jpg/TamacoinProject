@@ -376,7 +376,9 @@ def send_status(message):
         bot.send_message(chat_id, "Произошла непредвиденная ошибка при получении статуса. Пожалуйста, попробуйте позже.")
 
 # --- Добавьте другие обработчики здесь ---
-# Например:
+# Если у вас есть другие команды, такие как /feed, /play, /clean, /shop, /daily_bonus,
+# /users_count, /admin_stats и т.д., ВСТАВЬТЕ ИХ СЮДА.
+# Пример:
 # @bot.message_handler(commands=['feed'])
 # def feed_pet_command(message):
 #     # ... ваш код для /feed ...
@@ -456,3 +458,4 @@ if __name__ == '__main__':
         print("Bot will not run via webhook on Render.com.")
         print("For local testing, consider uncommenting bot.polling(none_stop=True).")
         # bot.polling(none_stop=True) # Для локального тестирования без вебхука, если нет вебхука
+
