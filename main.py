@@ -1,16 +1,15 @@
 # main.py
 
-# ====================================================================
-sys.stderr.write("##### VERIFICATION_MARKER_001: main.py started execution at " + str(datetime.datetime.now()) + " #####\n")
-# ====================================================================
-
 import os
-import sys # ОЧЕНЬ ВАЖНО: Убедитесь, что эта строка есть!
+import sys # ЭТОТ ИМПОРТ ДОЛЖЕН БЫТЬ ЗДЕСЬ, В САМОМ НАЧАЛЕ СПИСКА ИМПОРТОВ
 import telebot
 from telebot import types
 import datetime
 import math
 from flask import Flask, request
+
+# Теперь вы можете разместить свою уникальную метку после всех импортов
+sys.stderr.write("##### VERIFICATION_MARKER_001: main.py started execution at " + str(datetime.datetime.now()) + " #####\n")
 
 from db_manager import db
 from pet_config import (
@@ -35,7 +34,7 @@ def get_pet_status_and_image(pet):
     image_key = pet['pet_type'] + '_normal'
     status_text = f"Голод: {pet['hunger']:.1f}%\n" \
                   f"Счастье: {pet['happiness']:.1f}%\n" \
-                  f"Здоровье: {pet['health']:.1f}%"
+                  f"Здоровie: {pet['health']:.1f}%"
 
     if pet['is_alive'] == 0:
         image_key = 'dead_pet'
