@@ -4,9 +4,9 @@ from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMark
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from datetime import datetime, timedelta
 
-from db_manager import DBManager # Изменено: теперь импортируем класс DBManager
+from db_manager import DBManager # Импортируем класс DBManager
 import pet_config # Убедитесь, что этот файл существует и содержит PET_TYPES, PET_IMAGES
-from game_logic import PetGame # Убедитесь, что этот файл существует
+from game_logic import PetGame # Импортируем класс PetGame
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -22,11 +22,11 @@ if not TOKEN or not WEBHOOK_HOST:
 
 PORT = int(os.environ.get('PORT', 10000))
 
-# Инициализация DBManager
-db_manager = DBManager() # Изменено: получаем экземпляр DBManager
+# Инициализация DBManager (синглтон)
+db_manager = DBManager()
 
-# Инициализация PetGame с экземпляром DBManager
-game_instance = PetGame(db_manager) # Передача экземпляра db_manager в PetGame
+# Инициализация PetGame с экземпляром DBManager. Объект бота будет передаваться в методы PetGame.
+game_instance = PetGame(db_manager)
 
 # --- Текстовые константы ---
 START_MESSAGE = "Добро пожаловать в Tamacoin Game! Выберите своего первого питомца:"
@@ -63,21 +63,20 @@ Tamacoin - это не просто игровая валюта, это наст
 # --- Функции-обработчики команд ---
 
 async def start_command(update: Update, context):
-    user_id = update.effective_user.id
     telegram_id = update.effective_user.id
     username = update.effective_user.username
     first_name = update.effective_user.first_name
     last_name = update.effective_user.last_name
 
-    user = db_manager.get_user(telegram_id) # Изменено
+    user = db_manager.get_user(telegram_id)
     if user is None:
-        user_id = db_manager.add_user(telegram_id, username, first_name, last_name) # Изменено
+        internal_user_id = db_manager.add_user(telegram_id, username, first_name, last_name)
         logger.info(f"New user registered: {telegram_id}")
     else:
-        user_id = user[0]
+        internal_user_id = user[0] # Получаем внутренний ID пользователя
         logger.info(f"User {telegram_id} already exists. Checking for pet.")
 
-    pet = db_manager.get_pet(user_id) # Изменено
+    pet = db_manager.get_pet(internal_user_id)
     if pet is None:
         keyboard = [
             [InlineKeyboardButton(pet_type, callback_data=f"select_pet_{pet_type}") for pet_type in pet_config.PET_TYPES]
@@ -87,22 +86,18 @@ async def start_command(update: Update, context):
         await update.message.reply_text(SELECT_PET_MESSAGE)
     else:
         await update.message.reply_text("Добро пожаловать обратно! У вас уже есть питомец.")
-        # Optionally show pet status here
-        await game_instance.send_pet_status(update.effective_chat.id, user_id) # Изменено
+        await game_instance.send_pet_status(update.effective_chat.id, internal_user_id, context.bot) # Изменено
 
 async def button_callback_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
     
-    user_id = query.from_user.id
-    telegram_id = query.from_user.id # Use telegram_id directly for getting user record
+    telegram_id = query.from_user.id
     
-    # Get the internal user_id from the database
-    user_record = db_manager.get_user(telegram_id) # Изменено
+    user_record = db_manager.get_user(telegram_id)
     if user_record:
         internal_user_id = user_record[0]
     else:
-        # This scenario shouldn't happen if user started with /start
         await query.edit_message_text("Произошла ошибка: не удалось найти вашего пользователя. Пожалуйста, начните с /start.")
         return
 
@@ -111,14 +106,13 @@ async def button_callback_handler(update: Update, context):
         pet_type = data.split("_")[2]
         pet_name = pet_type # For simplicity, name is same as type initially
         
-        existing_pet = db_manager.get_pet(internal_user_id) # Изменено
+        existing_pet = db_manager.get_pet(internal_user_id)
         if existing_pet:
             await query.edit_message_text(f"У вас уже есть питомец: {existing_pet[3]} ({existing_pet[2]}).")
-            # Optionally send current pet status
-            await game_instance.send_pet_status(query.message.chat_id, internal_user_id) # Изменено
+            await game_instance.send_pet_status(query.message.chat_id, internal_user_id, context.bot) # Изменено
             return
 
-        success = db_manager.create_pet(internal_user_id, pet_type, pet_name) # Изменено
+        success = db_manager.create_pet(internal_user_id, pet_type, pet_name)
         if success:
             await query.edit_message_text(f"Поздравляем! Вы завели питомца: {pet_name} ({pet_type}).")
             
@@ -129,65 +123,65 @@ async def button_callback_handler(update: Update, context):
             else:
                 await context.bot.send_message(chat_id=query.message.chat_id, text=f"Изображение для {pet_type} не найдено.")
 
-            await game_instance.send_pet_status(query.message.chat_id, internal_user_id) # Изменено
+            await game_instance.send_pet_status(query.message.chat_id, internal_user_id, context.bot) # Изменено
         else:
             await query.edit_message_text("Не удалось завести питомца. Возможно, у вас уже есть питомец или произошла ошибка.")
 
 async def status_command(update: Update, context):
-    user_id = update.effective_user.id
-    user = db_manager.get_user(user_id) # Изменено
+    telegram_id = update.effective_user.id
+    user = db_manager.get_user(telegram_id)
     if user is None:
         await update.message.reply_text("Пожалуйста, начните игру с команды /start.")
         return
 
     internal_user_id = user[0]
-    pet = db_manager.get_pet(internal_user_id) # Изменено
+    pet = db_manager.get_pet(internal_user_id)
     if pet is None:
         await update.message.reply_text("У вас еще нет питомца! Выберите его, используя команду /start.")
     else:
-        await game_instance.send_pet_status(update.effective_chat.id, internal_user_id) # Изменено
+        await game_instance.send_pet_status(update.effective_chat.id, internal_user_id, context.bot) # Изменено
 
 async def feed_command(update: Update, context):
-    user_id = update.effective_user.id
-    user = db_manager.get_user(user_id) # Изменено
+    telegram_id = update.effective_user.id
+    user = db_manager.get_user(telegram_id)
     if user is None:
         await update.message.reply_text("Пожалуйста, начните игру с команды /start.")
         return
 
     internal_user_id = user[0]
-    pet = db_manager.get_pet(internal_user_id) # Изменено
+    pet = db_manager.get_pet(internal_user_id)
     if pet is None:
         await update.message.reply_text("У вас еще нет питомца! Выберите его, используя команду /start.")
     else:
-        await game_instance.feed_pet(update.effective_chat.id, internal_user_id) # Изменено
+        await game_instance.feed_pet(update.effective_chat.id, internal_user_id, context.bot) # Изменено
 
 async def play_command(update: Update, context):
-    user_id = update.effective_user.id
-    user = db_manager.get_user(user_id) # Изменено
+    telegram_id = update.effective_user.id
+    user = db_manager.get_user(telegram_id)
     if user is None:
         await update.message.reply_text("Пожалуйста, начните игру с команды /start.")
         return
 
     internal_user_id = user[0]
-    pet = db_manager.get_pet(internal_user_id) # Изменено
+    pet = db_manager.get_pet(internal_user_id)
     if pet is None:
         await update.message.reply_text("У вас еще нет питомца! Выберите его, используя команду /start.")
     else:
-        await game_instance.play_with_pet(update.effective_chat.id, internal_user_id) # Изменено
+        await game_instance.play_with_pet(update.effective_chat.id, internal_user_id, context.bot) # Изменено
 
 async def clean_command(update: Update, context):
-    user_id = update.effective_user.id
-    user = db_manager.get_user(user_id) # Изменено
+    telegram_id = update.effective_user.id
+    user = db_manager.get_user(telegram_id)
     if user is None:
         await update.message.reply_text("Пожалуйста, начните игру с команды /start.")
         return
 
     internal_user_id = user[0]
-    pet = db_manager.get_pet(internal_user_id) # Изменено
+    pet = db_manager.get_pet(internal_user_id)
     if pet is None:
         await update.message.reply_text("У вас еще нет питомца! Выберите его, используя команду /start.")
     else:
-        await game_instance.clean_pet_area(update.effective_chat.id, internal_user_id) # Изменено
+        await game_instance.clean_pet_area(update.effective_chat.id, internal_user_id, context.bot) # Изменено
 
 async def shop_command(update: Update, context):
     await update.message.reply_text(SHOP_CLOSED_MESSAGE)
@@ -199,14 +193,14 @@ async def info_command(update: Update, context):
     await update.message.reply_text(INFO_TEXT, parse_mode='Markdown')
 
 async def users_count_command(update: Update, context):
-    count = db_manager.get_total_users_count() # Изменено
+    count = db_manager.get_total_users_count()
     await update.message.reply_text(f"Общее количество пользователей: {count}.")
 
 async def admin_stats_command(update: Update, context):
     # !!! Важно: в реальном приложении нужно добавить проверку на администратора !!!
     # Например: if update.effective_user.id != YOUR_ADMIN_TELEGRAM_ID: return
     
-    stats = db_manager.get_game_stats() # Изменено
+    stats = db_manager.get_game_stats()
     if stats:
         await update.message.reply_text(
             f"Административная статистика:\n"
@@ -251,3 +245,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
