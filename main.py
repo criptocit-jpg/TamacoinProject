@@ -221,6 +221,9 @@ async def admin_stats_command(update: Update, context):
 async def echo(update: Update, context):
     await update.message.reply_text("Я не понимаю этой команды. Используйте /help для списка команд.")
 
+# >>> НОВАЯ ФУНКЦИЯ ДЛЯ ОТЛАДКИ ВСЕХ ОБНОВЛЕНИЙ <<<
+async def log_all_updates(update: Update, context):
+    logger.info(f"Received raw Update: {update.to_dict()}")
 
 def main():
     application = Application.builder().token(TOKEN).build()
@@ -240,8 +243,13 @@ def main():
     # Обработчик callback-кнопок
     application.add_handler(CallbackQueryHandler(button_callback_handler))
 
-    # Обработчик для всех остальных сообщений (опционально)
+    # Обработчик для всех остальных текстовых сообщений, которые не являются командами
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    # >>> ЭТА НОВАЯ СТРОКА ОЧЕНЬ ВАЖНА ДЛЯ ДИАГНОСТИКИ <<<
+    # Добавляем обработчик, который логирует ВСЕ входящие обновления.
+    # Он должен быть после всех других более специфичных обработчиков.
+    application.add_handler(MessageHandler(filters.ALL, log_all_updates))
 
     # Запуск бота на Render с вебхуками
     application.run_webhook(
@@ -253,3 +261,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
