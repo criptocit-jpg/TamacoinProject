@@ -1,324 +1,283 @@
-import sqlite3
-import datetime
-import json
-import sys # Добавьте этот импорт, если его нет
+import os
+import psycopg2
+from psycopg2 import sql
+import logging
+
+# Настройка логирования для отладки
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class DBManager:
     _instance = None
-    _is_initialized = False
+    _connection = None
 
-    def __new__(cls, db_path='tamacoin_game.db'):
-        sys.stderr.write("DEBUG_DB: Attempting global DBManager instance initialization.\n")
+    def __new__(cls):
         if cls._instance is None:
             cls._instance = super(DBManager, cls).__new__(cls)
-            cls._instance.db_path = db_path
-            if not cls._is_initialized:
-                cls._instance._init_db()
-                cls._is_initialized = True
         return cls._instance
 
-    def _init_db(self):
-        sys.stderr.write("DEBUG_DB: DBManager __init__ started.\n")
-        self.conn = None
+    def __init__(self):
+        if DBManager._connection is None:
+            self._connect()
+
+    def _connect(self):
         try:
-            self.conn = sqlite3.connect(self.db_path)
-            self.conn.row_factory = sqlite3.Row
-            sys.stderr.write(f"DEBUG_DB: SQLite connected to {self.db_path}.\n")
+            database_url = os.getenv('DATABASE_URL')
+            if not database_url:
+                logger.error("DATABASE_URL environment variable not set.")
+                raise ValueError("DATABASE_URL environment variable not set.")
+            
+            DBManager._connection = psycopg2.connect(database_url)
+            DBManager._connection.autocommit = True # Автоматическая фиксация изменений
+            logger.info("Successfully connected to PostgreSQL database.")
             self._create_tables()
-            self._initialize_game_stats()
-            sys.stderr.write("DEBUG_DB: DBManager __init__ finished successfully.\n")
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: SQLite connection or initialization error: {e}\n")
-            if self.conn:
-                self.conn.close()
-            self.conn = None
-            raise
+        except Exception as e:
+            logger.exception(f"Error connecting to PostgreSQL database: {e}")
+            DBManager._connection = None # Сбросить соединение, чтобы при следующей попытке оно было None
+            raise # Повторно выбросить исключение, чтобы остановить инициализацию, если БД недоступна
 
     def _get_cursor(self):
-        try:
-            if not self.conn: # sqlite3 не имеет ping(), поэтому просто проверяем, что conn не None
-                raise sqlite3.Error("Connection is closed or invalid.")
-            self.conn.cursor() # Пробуем получить курсор, чтобы проверить соединение
-        except (sqlite3.Error, AttributeError):
-            sys.stderr.write("DEBUG_DB: Re-establishing SQLite connection.\n")
-            try:
-                self.conn = sqlite3.connect(self.db_path)
-                self.conn.row_factory = sqlite3.Row
-            except sqlite3.Error as e:
-                sys.stderr.write(f"FATAL_ERROR_DB: Could not re-establish SQLite connection: {e}\n")
-                raise
-        return self.conn.cursor()
+        if DBManager._connection is None or DBManager._connection.closed:
+            logger.debug("Re-establishing PostgreSQL connection.")
+            self._connect() # Попытка переподключения
+        return DBManager._connection.cursor()
 
     def _create_tables(self):
-        sys.stderr.write("DEBUG_DB: _create_tables started.\n")
         try:
-            cursor = self._get_cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    telegram_id INTEGER UNIQUE NOT NULL,
-                    username TEXT,
-                    balance REAL DEFAULT 0.0,
-                    pet_id INTEGER,
-                    daily_bonus_last_claimed TEXT,
-                    FOREIGN KEY (pet_id) REFERENCES pets (owner_id) ON DELETE SET NULL
-                )
-            """)
-            sys.stderr.write("DEBUG_DB: Users table checked/created.\n")
+            with self._get_cursor() as cur:
+                # Создаем таблицу users
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        telegram_id BIGINT UNIQUE NOT NULL,
+                        username VARCHAR(255),
+                        first_name VARCHAR(255),
+                        last_name VARCHAR(255),
+                        balance INTEGER DEFAULT 0,
+                        last_daily_bonus TIMESTAMP
+                    );
+                """)
+                logger.debug("Table 'users' ensured to exist.")
 
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS pets (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    owner_id INTEGER UNIQUE NOT NULL,
-                    pet_type TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    hunger REAL DEFAULT 100.0,
-                    happiness REAL DEFAULT 100.0,
-                    health REAL DEFAULT 100.0,
-                    is_alive INTEGER DEFAULT 1,
-                    last_state_update TEXT,
-                    last_action_time TEXT,
-                    FOREIGN KEY (owner_id) REFERENCES users (id) ON DELETE CASCADE
-                )
-            """)
-            sys.stderr.write("DEBUG_DB: Pets table checked/created.\n")
-            
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS game_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    total_tamacoins_circulating REAL DEFAULT 0.0,
-                    total_pets_created INTEGER DEFAULT 0,
-                    last_update TEXT
-                )
-            """)
-            sys.stderr.write("DEBUG_DB: Game stats table checked/created.\n")
+                # Создаем таблицу pets
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS pets (
+                        id SERIAL PRIMARY KEY,
+                        owner_id INTEGER UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                        pet_type VARCHAR(50) NOT NULL,
+                        name VARCHAR(255),
+                        health INTEGER DEFAULT 100,
+                        happiness INTEGER DEFAULT 100,
+                        hunger INTEGER DEFAULT 0,
+                        last_fed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_played TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_cleaned TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_interacted TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                logger.debug("Table 'pets' ensured to exist.")
 
-            self.conn.commit()
-            sys.stderr.write("DEBUG_DB: _create_tables finished successfully.\n")
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error creating tables: {e}\n")
-            raise
+                # Создаем таблицу game_stats (для статистики)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS game_stats (
+                        id SERIAL PRIMARY KEY,
+                        total_emitted_tamacoin BIGINT DEFAULT 0,
+                        total_users BIGINT DEFAULT 0
+                    );
+                """)
+                logger.debug("Table 'game_stats' ensured to exist.")
+                
+                # Инициализация game_stats, если она пуста
+                cur.execute("SELECT COUNT(*) FROM game_stats;")
+                if cur.fetchone()[0] == 0:
+                    cur.execute("INSERT INTO game_stats (total_emitted_tamacoin, total_users) VALUES (0, 0);")
+                    logger.debug("game_stats initialized.")
 
-    def _initialize_game_stats(self):
-        sys.stderr.write("DEBUG_DB: _initialize_game_stats started.\n")
-        try:
-            cursor = self._get_cursor()
-            cursor.execute("SELECT COUNT(*) FROM game_stats")
-            count = cursor.fetchone()[0]
-            if count == 0:
-                from pet_config import TOTAL_INITIAL_SUPPLY
-                initial_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                cursor.execute(
-                    "INSERT INTO game_stats (total_tamacoins_circulating, total_pets_created, last_update) VALUES (?, ?, ?)",
-                    (TOTAL_INITIAL_SUPPLY, 0, initial_time)
-                )
-                self.conn.commit()
-                sys.stderr.write(f"DEBUG_DB: Game stats initialized with TOTAL_INITIAL_SUPPLY: {TOTAL_INITIAL_SUPPLY}.\n")
-            else:
-                sys.stderr.write("DEBUG_DB: Game stats already initialized (row exists).\n")
-            sys.stderr.write("DEBUG_DB: _initialize_game_stats finished successfully.\n")
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error initializing game stats: {e}\n")
-            raise
+        except Exception as e:
+            logger.exception(f"Error creating tables: {e}")
+            raise # Перевыбросить исключение
 
-    def create_user(self, telegram_id, username):
-        sys.stderr.write(f"DEBUG_DB: create_user called for telegram_id: {telegram_id}, username: {username}\n")
-        try:
-            cursor = self._get_cursor()
-            from pet_config import INITIAL_TAMACIONS_BALANCE
-            cursor.execute(
-                "INSERT INTO users (telegram_id, username, balance, daily_bonus_last_claimed) VALUES (?, ?, ?, ?)",
-                (telegram_id, username, INITIAL_TAMACIONS_BALANCE, datetime.datetime.now(datetime.timezone.utc).isoformat())
-            )
-            self.conn.commit()
-            new_user_id = cursor.lastrowid
-            sys.stderr.write(f"DEBUG_DB: User created: id={new_user_id}, telegram_id={telegram_id}, balance={INITIAL_TAMACIONS_BALANCE}.\n")
-            return self.get_user(telegram_id)
-        except sqlite3.IntegrityError:
-            sys.stderr.write(f"WARNING_DB: User with telegram_id {telegram_id} already exists. Returning existing user.\n")
-            return self.get_user(telegram_id)
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error creating user {telegram_id}: {e}\n")
-            return None
+    def close(self):
+        if DBManager._connection:
+            DBManager._connection.close()
+            DBManager._connection = None
+            logger.info("Database connection closed.")
 
     def get_user(self, telegram_id):
-        sys.stderr.write(f"DEBUG_DB: get_user called for telegram_id: {telegram_id}\n")
+        logger.debug(f"get_user called for telegram_id: {telegram_id}")
         try:
-            cursor = self._get_cursor()
-            cursor.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
-            user = cursor.fetchone()
-            if user:
-                user_dict = dict(user)
-                sys.stderr.write(f"DEBUG_DB: User found: {user_dict['username']} (ID: {user_dict['id']}).\n")
-                return user_dict
-            sys.stderr.write(f"DEBUG_DB: User with telegram_id {telegram_id} not found.\n")
+            with self._get_cursor() as cur:
+                cur.execute("SELECT id, telegram_id, username, first_name, last_name, balance, last_daily_bonus FROM users WHERE telegram_id = %s;", (telegram_id,))
+                user_data = cur.fetchone()
+                if user_data:
+                    logger.debug(f"User found: {user_data}")
+                    # Преобразуем timestamp в datetime объект, если он есть
+                    user_data_list = list(user_data)
+                    if user_data_list[6]: # last_daily_bonus
+                        user_data_list[6] = user_data_list[6].replace(tzinfo=None) # Удаляем информацию о таймзоне
+                    return tuple(user_data_list)
+                logger.debug(f"User not found for telegram_id: {telegram_id}")
+                return None
+        except Exception as e:
+            logger.exception(f"Error getting user {telegram_id}: {e}")
             return None
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error getting user {telegram_id}: {e}\n")
+
+    def add_user(self, telegram_id, username, first_name, last_name):
+        logger.debug(f"add_user called for telegram_id: {telegram_id}")
+        try:
+            with self._get_cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (telegram_id, username, first_name, last_name) VALUES (%s, %s, %s, %s) RETURNING id;",
+                    (telegram_id, username, first_name, last_name)
+                )
+                user_id = cur.fetchone()[0]
+                logger.info(f"User {telegram_id} added with internal ID: {user_id}")
+                # Обновляем game_stats
+                cur.execute("UPDATE game_stats SET total_users = total_users + 1;")
+                return user_id
+        except psycopg2.errors.UniqueViolation:
+            logger.warning(f"User {telegram_id} already exists (add_user called but user exists).")
+            return self.get_user(telegram_id)[0] # Возвращаем ID существующего пользователя
+        except Exception as e:
+            logger.exception(f"Error adding user {telegram_id}: {e}")
             return None
 
     def update_user_balance(self, user_id, amount):
-        sys.stderr.write(f"DEBUG_DB: update_user_balance called for user_id: {user_id}, amount: {amount}\n")
+        logger.debug(f"update_user_balance called for user_id: {user_id}, amount: {amount}")
         try:
-            cursor = self._get_cursor()
-            cursor.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, user_id))
-            self.conn.commit()
-            sys.stderr.write(f"DEBUG_DB: User {user_id} balance updated by {amount}.\n")
-            return True
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error updating user {user_id} balance: {e}\n")
-            return False
+            with self._get_cursor() as cur:
+                cur.execute("UPDATE users SET balance = balance + %s WHERE id = %s RETURNING balance;", (amount, user_id))
+                new_balance = cur.fetchone()[0]
+                logger.info(f"User {user_id} balance updated to {new_balance}. Amount: {amount}")
+                # Обновляем game_stats, если добавляем монеты
+                if amount > 0:
+                    cur.execute("UPDATE game_stats SET total_emitted_tamacoin = total_emitted_tamacoin + %s;", (amount,))
+                return new_balance
+        except Exception as e:
+            logger.exception(f"Error updating user {user_id} balance: {e}")
+            return None
 
-    def update_user_pet_id(self, user_id, pet_id):
-        sys.stderr.write(f"DEBUG_DB: update_user_pet_id called for user_id: {user_id}, pet_id: {pet_id}\n")
+    def update_user_daily_bonus_time(self, user_id):
+        logger.debug(f"update_user_daily_bonus_time called for user_id: {user_id}")
         try:
-            cursor = self._get_cursor()
-            cursor.execute("UPDATE users SET pet_id = ? WHERE id = ?", (pet_id, user_id))
-            self.conn.commit()
-            sys.stderr.write(f"DEBUG_DB: User {user_id} pet_id updated to {pet_id}.\n")
+            from datetime import datetime
+            with self._get_cursor() as cur:
+                cur.execute("UPDATE users SET last_daily_bonus = %s WHERE id = %s;", (datetime.now(), user_id))
+                logger.info(f"User {user_id} last_daily_bonus updated.")
             return True
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error updating user {user_id} pet_id: {e}\n")
-            return False
-
-    def update_daily_bonus_time(self, user_id, timestamp):
-        sys.stderr.write(f"DEBUG_DB: update_daily_bonus_time called for user_id: {user_id}, timestamp: {timestamp}\n")
-        try:
-            cursor = self._get_cursor()
-            cursor.execute("UPDATE users SET daily_bonus_last_claimed = ? WHERE id = ?", (timestamp, user_id))
-            self.conn.commit()
-            sys.stderr.write(f"DEBUG_DB: User {user_id} daily_bonus_last_claimed updated.\n")
-            return True
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error updating daily bonus time for user {user_id}: {e}\n")
+        except Exception as e:
+            logger.exception(f"Error updating last_daily_bonus for user {user_id}: {e}")
             return False
 
     def create_pet(self, owner_id, pet_type, name):
-        sys.stderr.write(f"DEBUG_DB: create_pet called for owner_id: {owner_id}, pet_type: {pet_type}, name: {name}\n")
+        logger.debug(f"create_pet called for owner_id: {owner_id}, pet_type: {pet_type}, name: {name}")
         try:
-            cursor = self._get_cursor()
-            current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            cursor.execute(
-                "INSERT INTO pets (owner_id, pet_type, name, last_state_update, last_action_time) VALUES (?, ?, ?, ?, ?)",
-                (owner_id, pet_type, name, current_time, current_time)
-            )
-            self.conn.commit()
-            new_pet_id = cursor.lastrowid
-            self.update_user_pet_id(owner_id, new_pet_id)
-            self.increment_total_pets_created()
-            sys.stderr.write(f"DEBUG_DB: Pet created: id={new_pet_id}, owner_id={owner_id}, type={pet_type}, name={name}.\n")
-            return self.get_pet(owner_id)
-        except sqlite3.IntegrityError:
-            sys.stderr.write(f"WARNING_DB: Pet for owner_id {owner_id} already exists. Cannot create duplicate.\n")
-            return None
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error creating pet for owner_id {owner_id}: {e}\n")
-            return None
+            with self._get_cursor() as cur:
+                cur.execute(
+                    "INSERT INTO pets (owner_id, pet_type, name) VALUES (%s, %s, %s);",
+                    (owner_id, pet_type, name)
+                )
+                logger.info(f"Pet '{name}' of type '{pet_type}' created for user {owner_id}.")
+            return True
+        except psycopg2.errors.UniqueViolation:
+            logger.warning(f"Pet already exists for owner_id {owner_id}. Skipping creation.")
+            return False # Или True, если вы считаете, что это не ошибка
+        except Exception as e:
+            logger.exception(f"Error creating pet for owner_id {owner_id}: {e}")
+            return False
 
     def get_pet(self, owner_id):
-        sys.stderr.write(f"DEBUG_DB: get_pet called for owner_id: {owner_id}\n")
+        logger.debug(f"get_pet called for owner_id: {owner_id}")
         try:
-            cursor = self._get_cursor()
-            cursor.execute("SELECT * FROM pets WHERE owner_id = ?", (owner_id,))
-            pet = cursor.fetchone()
-            if pet:
-                pet_dict = dict(pet)
-                sys.stderr.write(f"DEBUG_DB: Pet found for owner {owner_id}: {pet_dict['name']} (ID: {pet_dict['id']}).\n")
-                return pet_dict
-            sys.stderr.write(f"DEBUG_DB: Pet not found for owner_id {owner_id}.\n")
+            with self._get_cursor() as cur:
+                cur.execute(
+                    "SELECT id, owner_id, pet_type, name, health, happiness, hunger, last_fed, last_played, last_cleaned, last_interacted FROM pets WHERE owner_id = %s;",
+                    (owner_id,)
+                )
+                pet_data = cur.fetchone()
+                if pet_data:
+                    logger.debug(f"Pet found for owner_id: {owner_id}")
+                    # Преобразовать timestamp в datetime объекты, если они есть
+                    pet_data_list = list(pet_data)
+                    for i in [7, 8, 9, 10]: # Индексы для last_fed, last_played, last_cleaned, last_interacted
+                        if pet_data_list[i]:
+                            pet_data_list[i] = pet_data_list[i].replace(tzinfo=None) # Удаляем информацию о таймзоне
+                    return tuple(pet_data_list)
+                logger.debug(f"Pet not found for owner_id {owner_id}.")
+                return None
+        except Exception as e:
+            logger.exception(f"Error getting pet for owner_id {owner_id}: {e}")
             return None
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error getting pet for owner_id {owner_id}: {e}\n")
-            return None
 
-    def update_pet_state(self, owner_id, hunger, happiness, health, last_state_update):
-        sys.stderr.write(f"DEBUG_DB: update_pet_state called for owner_id: {owner_id}, hunger: {hunger}, happiness: {happiness}, health: {health}\n")
+    def update_pet_stats(self, pet_id, health=None, happiness=None, hunger=None, last_fed=None, last_played=None, last_cleaned=None, last_interacted=None):
+        logger.debug(f"update_pet_stats called for pet_id: {pet_id}")
         try:
-            cursor = self._get_cursor()
-            cursor.execute(
-                "UPDATE pets SET hunger = ?, happiness = ?, health = ?, last_state_update = ? WHERE owner_id = ?",
-                (hunger, happiness, health, last_state_update, owner_id)
+            updates = []
+            params = []
+            from datetime import datetime
+
+            if health is not None:
+                updates.append("health = %s")
+                params.append(health)
+            if happiness is not None:
+                updates.append("happiness = %s")
+                params.append(happiness)
+            if hunger is not None:
+                updates.append("hunger = %s")
+                params.append(hunger)
+            if last_fed is not None:
+                updates.append("last_fed = %s")
+                params.append(last_fed if isinstance(last_fed, datetime) else datetime.now())
+            if last_played is not None:
+                updates.append("last_played = %s")
+                params.append(last_played if isinstance(last_played, datetime) else datetime.now())
+            if last_cleaned is not None:
+                updates.append("last_cleaned = %s")
+                params.append(last_cleaned if isinstance(last_cleaned, datetime) else datetime.now())
+            if last_interacted is not None:
+                updates.append("last_interacted = %s")
+                params.append(last_interacted if isinstance(last_interacted, datetime) else datetime.now())
+            
+            if not updates:
+                logger.warning(f"No stats to update for pet_id {pet_id}.")
+                return False
+
+            query = sql.SQL("UPDATE pets SET {} WHERE id = %s;").format(
+                sql.SQL(", ").join(map(sql.SQL, updates))
             )
-            self.conn.commit()
-            sys.stderr.write(f"DEBUG_DB: Pet state updated for owner_id {owner_id}.\n")
-            return True
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error updating pet state for owner_id {owner_id}: {e}\n")
-            return False
+            params.append(pet_id)
 
-    def update_pet_action_time(self, owner_id, last_action_time):
-        sys.stderr.write(f"DEBUG_DB: update_pet_action_time called for owner_id: {owner_id}, time: {last_action_time}\n")
-        try:
-            cursor = self._get_cursor()
-            cursor.execute("UPDATE pets SET last_action_time = ? WHERE owner_id = ?", (last_action_time, owner_id))
-            self.conn.commit()
-            sys.stderr.write(f"DEBUG_DB: Pet last_action_time updated for owner_id {owner_id}.\n")
+            with self._get_cursor() as cur:
+                cur.execute(query, tuple(params))
+                logger.info(f"Pet {pet_id} stats updated.")
             return True
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error updating pet action time for owner_id {owner_id}: {e}\n")
-            return False
-
-    def kill_pet(self, owner_id):
-        sys.stderr.write(f"DEBUG_DB: kill_pet called for owner_id: {owner_id}\n")
-        try:
-            cursor = self._get_cursor()
-            cursor.execute(
-                "UPDATE pets SET is_alive = 0, hunger = 0.0, happiness = 0.0, health = 0.0 WHERE owner_id = ?",
-                (owner_id,)
-            )
-            self.conn.commit()
-            sys.stderr.write(f"DEBUG_DB: Pet for owner_id {owner_id} marked as dead.\n")
-            return True
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error killing pet for owner_id {owner_id}: {e}\n")
-            return False
-
-    def increment_total_pets_created(self):
-        sys.stderr.write("DEBUG_DB: increment_total_pets_created called.\n")
-        try:
-            cursor = self._get_cursor()
-            cursor.execute("UPDATE game_stats SET total_pets_created = total_pets_created + 1, last_update = ?",
-                           (datetime.datetime.now(datetime.timezone.utc).isoformat(),))
-            self.conn.commit()
-            sys.stderr.write("DEBUG_DB: total_pets_created incremented.\n")
-            return True
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error incrementing total_pets_created: {e}\n")
+        except Exception as e:
+            logger.exception(f"Error updating pet {pet_id} stats: {e}")
             return False
 
     def get_game_stats(self):
-        sys.stderr.write("DEBUG_DB: get_game_stats called.\n")
+        logger.debug("get_game_stats called.")
         try:
-            cursor = self._get_cursor()
-            cursor.execute("SELECT * FROM game_stats LIMIT 1")
-            stats = cursor.fetchone()
-            if stats:
-                stats_dict = dict(stats)
-                sys.stderr.write(f"DEBUG_DB: Game stats retrieved: {stats_dict}.\n")
-                return stats_dict
-            sys.stderr.write("DEBUG_DB: No game stats found.\n")
-            return None
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error getting game stats: {e}\n")
-            return None
+            with self._get_cursor() as cur:
+                cur.execute("SELECT total_emitted_tamacoin, total_users FROM game_stats LIMIT 1;")
+                stats = cur.fetchone()
+                if stats:
+                    logger.debug(f"Game stats found: {stats}")
+                    return {"total_emitted_tamacoin": stats[0], "total_users": stats[1]}
+                logger.warning("Game stats not found or table empty.")
+                return {"total_emitted_tamacoin": 0, "total_users": 0}
+        except Exception as e:
+            logger.exception(f"Error getting game stats: {e}")
+            return {"total_emitted_tamacoin": 0, "total_users": 0}
 
     def get_total_users_count(self):
-        sys.stderr.write("DEBUG_DB: get_total_users_count called.\n")
+        logger.debug("get_total_users_count called.")
         try:
-            cursor = self._get_cursor()
-            cursor.execute("SELECT COUNT(*) FROM users")
-            count = cursor.fetchone()[0]
-            sys.stderr.write(f"DEBUG_DB: Total users count: {count}.\n")
-            return count
-        except sqlite3.Error as e:
-            sys.stderr.write(f"ERROR_DB: Error getting total users count: {e}\n")
+            with self._get_cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users;")
+                count = cur.fetchone()[0]
+                logger.debug(f"Total users count: {count}")
+                return count
+        except Exception as e:
+            logger.exception(f"Error getting total users count: {e}")
             return 0
-
-try:
-    db = DBManager()
-    sys.stderr.write("DEBUG_DB: Global DBManager instance initialization completed successfully.\n")
-except Exception as e:
-    sys.stderr.write(f"FATAL_ERROR: Failed to initialize DBManager: {e}\n")
-    import traceback
-    sys.stderr.write(traceback.format_exc())
-    db = None
