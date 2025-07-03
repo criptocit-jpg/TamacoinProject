@@ -1,519 +1,254 @@
-# main.py
-
 import os
-import sys
-import telebot
-from telebot import types
-import datetime
-import math
-from flask import Flask, request
+import logging
+from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from datetime import datetime, timedelta
 
-# Теперь вы можете разместить свою уникальную метку после всех импортов
-sys.stderr.write("##### VERIFICATION_MARKER_001: main.py started execution at " + str(datetime.datetime.now()) + " #####\n")
+from db_manager import DBManager # Изменено: теперь импортируем класс DBManager
+import pet_config # Убедитесь, что этот файл существует и содержит PET_TYPES, PET_IMAGES
+from game_logic import PetGame # Убедитесь, что этот файл существует
 
-from db_manager import db
-from pet_config import (
-    PET_TYPES, PET_IMAGES, INITIAL_TAMACIONS_BALANCE, WELCOME_BONUS_AMOUNT,
-    WELCOME_BONUS_ACTIONS_REQUIRED, DAILY_BONUS_AMOUNT,
-    DAILY_BONUS_INTERVAL_HOURS, FOOD_COST, MEDICINE_COST, NEW_PET_COST,
-    FEED_REWARD, PLAY_REWARD, CLEAN_REWARD, ACTION_COOLDOWN_HOURS,
-    HUNGER_DECAY_PER_HOUR, HAPPINESS_DECAY_PER_HOUR, HEALTH_DECAY_PER_HOUR,
-    HUNGER_THRESHOLD_SAD, HAPPINESS_THRESHOLD_SAD, HEALTH_THRESHOLD_SICK,
-    TOTAL_INITIAL_SUPPLY, ADMIN_TELEGRAM_ID, INFO_TEXT, HELP_TEXT
-)
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Получение токена бота и хоста вебхука из переменных окружения
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
-WEBHOOK_URL = f"https://{WEBHOOK_HOST}/{API_TOKEN}"
 
-bot = telebot.TeleBot(API_TOKEN)
-app = Flask(__name__)
+if not TOKEN or not WEBHOOK_HOST:
+    logger.error("API_TOKEN or WEBHOOK_HOST environment variable not set.")
+    raise ValueError("API_TOKEN or WEBHOOK_HOST environment variable not set.")
 
-def get_pet_status_and_image(pet):
-    sys.stderr.write(f"DEBUG_HELPER: get_pet_status_and_image called for pet {pet['id']}.\n")
-    image_key = pet['pet_type'] + '_normal'
-    status_text = f"Голод: {pet['hunger']:.1f}%\n" \
-                  f"Счастье: {pet['happiness']:.1f}%\n" \
-                  f"Здоровie: {pet['health']:.1f}%"
+PORT = int(os.environ.get('PORT', 10000))
 
-    if pet['is_alive'] == 0:
-        image_key = 'dead_pet'
-        status_text = "Ваш питомец мертв. 😢"
-    elif pet['hunger'] < HUNGER_THRESHOLD_SAD:
-        image_key = pet['pet_type'] + '_hungry'
-        status_text += "\n*Питомец голоден!*"
-    elif pet['happiness'] < HAPPINESS_THRESHOLD_SAD:
-        image_key = pet['pet_type'] + '_sad' # Если есть картинка для грустного
-        status_text += "\n*Питомец грустит!*"
-    elif pet['health'] < HEALTH_THRESHOLD_SICK:
-        image_key = pet['pet_type'] + '_sick' # Если есть картинка для больного
-        status_text += "\n*Питомец болен!*"
+# Инициализация DBManager
+db_manager = DBManager() # Изменено: получаем экземпляр DBManager
 
-    # Используем .get() с запасным вариантом, чтобы избежать KeyError
-    image_path = PET_IMAGES.get(image_key, PET_IMAGES.get(pet['pet_type'] + '_normal', PET_IMAGES['dead_pet']))
-    sys.stderr.write(f"DEBUG_HELPER: Image path determined: {image_path} for key {image_key}.\n")
-    return status_text, image_path
+# Инициализация PetGame с экземпляром DBManager
+game_instance = PetGame(db_manager) # Передача экземпляра db_manager в PetGame
 
-def update_pet_stats_over_time(pet):
-    sys.stderr.write(f"DEBUG_HELPER: update_pet_stats_over_time called for pet {pet['id']}.\n")
-    if pet['is_alive'] == 0:
-        sys.stderr.write(f"DEBUG_HELPER: Pet {pet['id']} is dead, no state update needed.\n")
-        return pet
+# --- Текстовые константы ---
+START_MESSAGE = "Добро пожаловать в Tamacoin Game! Выберите своего первого питомца:"
+SELECT_PET_MESSAGE = "Кого вы хотите завести?"
+SHOP_CLOSED_MESSAGE = "Магазин пока закрыт на реконструкцию. Заходите позже!"
+DAILY_BONUS_UNAVAILABLE = "Ежедневный бонус будет доступен скоро! (Логика пока не реализована)"
+INFO_TEXT = """
+**TAMACOIN Game - Играй, развивай, зарабатывай!**
 
-    last_update_time_str = pet.get('last_state_update')
-    if not last_update_time_str:
-        sys.stderr.write(f"DEBUG_HELPER: last_state_update missing for pet {pet['id']}, initializing.\n")
-        # Убедитесь, что `pet` обновляется из базы после первого сохранения
-        db.update_pet_state(pet['owner_id'], pet['hunger'], pet['happiness'], pet['health'], datetime.datetime.now(datetime.timezone.utc).isoformat())
-        pet = db.get_pet(pet['owner_id'])
-        last_update_time_str = pet['last_state_update']
+Добро пожаловать в мир Tamacoin, где ты можешь завести своего уникального питомца и заботиться о нём! Твои действия влияют на его настроение, здоровье и голод.
 
-    try:
-        last_update_time = datetime.datetime.fromisoformat(last_update_time_str)
-    except ValueError:
-        sys.stderr.write(f"ERROR_HELPER: Invalid last_state_update format '{last_update_time_str}' for pet {pet['id']}. Using current time.\n")
-        last_update_time = datetime.datetime.now(datetime.timezone.utc)
-        db.update_pet_state(pet['owner_id'], pet['hunger'], pet['happiness'], pet['health'], last_update_time.isoformat())
-        pet = db.get_pet(pet['owner_id']) # Снова получаем обновленные данные
+**🎮 Геймплей:**
+* **Заботься о питомце:** Корми его, играй с ним, убирай за ним. От этого зависит его состояние.
+* **Зарабатывай Tamacoin:** Выполняй ежедневные задания, участвуй в мини-играх (скоро!), торгуй на рынке (скоро!).
+* **Развивайся:** Покупай улучшения и новые предметы в магазине.
 
-    current_time = datetime.datetime.now(datetime.timezone.utc)
-    time_elapsed = (current_time - last_update_time).total_seconds() / 3600
+**💰 Что такое Tamacoin (Jetton на TON)?**
+Tamacoin - это не просто игровая валюта, это настоящий **Jetton на блокчейне TON**! Это означает, что все твои заработанные монеты - это реальные активы, которые можно вывести и использовать вне игры. Мы стремимся к полной децентрализации и прозрачности!
 
-    if time_elapsed <= 0:
-        sys.stderr.write(f"DEBUG_HELPER: No significant time elapsed ({time_elapsed:.2f}h) for pet {pet['id']}.\n")
-        return pet
+**🛡️ Безопасность и Технологии:**
+Игра построена на передовых блокчейн-технологиях TON, обеспечивая безопасность и прозрачность всех транзакций. Твой прогресс и активы надежно защищены.
 
-    sys.stderr.write(f"DEBUG_HELPER: Time elapsed for pet {pet['id']}: {time_elapsed:.2f} hours.\n")
+**🚀 Будущее игры:**
+Мы постоянно работаем над добавлением нового функционала:
+* Мини-игры и квесты
+* Торговая площадка для питомцев и предметов
+* Система обмена Tamacoin на другие криптовалюты
+* Социальные функции и рейтинги
 
-    new_hunger = max(0.0, pet['hunger'] - (HUNGER_DECAY_PER_HOUR * time_elapsed))
-    new_happiness = max(0.0, pet['happiness'] - (HAPPINESS_DECAY_PER_HOUR * time_elapsed))
+Присоединяйся к нашему сообществу и стань частью будущего Tamacoin!
+"""
 
-    health_decay_multiplier = 1.0
-    if new_hunger < HUNGER_THRESHOLD_SAD:
-        health_decay_multiplier += 0.5
-        sys.stderr.write(f"DEBUG_HELPER: Hunger below threshold for pet {pet['id']}, increasing health decay.\n")
-    if new_happiness < HAPPINESS_THRESHOLD_SAD:
-        health_decay_multiplier += 0.5
-        sys.stderr.write(f"DEBUG_HELPER: Happiness below threshold for pet {pet['id']}, increasing health decay.\n")
 
-    new_health = max(0.0, pet['health'] - (HEALTH_DECAY_PER_HOUR * time_elapsed * health_decay_multiplier))
+# --- Функции-обработчики команд ---
 
-    # Проверка на смерть
-    if new_hunger <= 0 or new_happiness <= 0 or new_health <= 0:
-        db.kill_pet(pet['owner_id'])
-        pet['is_alive'] = 0
-        pet['hunger'] = 0.0
-        pet['happiness'] = 0.0
-        pet['health'] = 0.0
-        sys.stderr.write(f"DEBUG_PET_STATE: Pet {pet['name']} (owner {pet['owner_id']}) has died due to low stats.\n")
+async def start_command(update: Update, context):
+    user_id = update.effective_user.id
+    telegram_id = update.effective_user.id
+    username = update.effective_user.username
+    first_name = update.effective_user.first_name
+    last_name = update.effective_user.last_name
+
+    user = db_manager.get_user(telegram_id) # Изменено
+    if user is None:
+        user_id = db_manager.add_user(telegram_id, username, first_name, last_name) # Изменено
+        logger.info(f"New user registered: {telegram_id}")
     else:
-        db.update_pet_state(pet['owner_id'], new_hunger, new_happiness, new_health, current_time.isoformat())
-        pet['hunger'] = new_hunger
-        pet['happiness'] = new_happiness
-        pet['health'] = new_health
-        sys.stderr.write(f"DEBUG_PET_STATE: Pet {pet['name']} (owner {pet['owner_id']}) state updated to H:{new_hunger:.1f}, P:{new_happiness:.1f}, L:{new_health:.1f}.\n")
+        user_id = user[0]
+        logger.info(f"User {telegram_id} already exists. Checking for pet.")
 
-    return pet
+    pet = db_manager.get_pet(user_id) # Изменено
+    if pet is None:
+        keyboard = [
+            [InlineKeyboardButton(pet_type, callback_data=f"select_pet_{pet_type}") for pet_type in pet_config.PET_TYPES]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(START_MESSAGE, reply_markup=reply_markup)
+        await update.message.reply_text(SELECT_PET_MESSAGE)
+    else:
+        await update.message.reply_text("Добро пожаловать обратно! У вас уже есть питомец.")
+        # Optionally show pet status here
+        await game_instance.send_pet_status(update.effective_chat.id, user_id) # Изменено
 
-@bot.callback_query_handler(func=lambda call: True)
-def debug_all_callbacks(call):
-    sys.stderr.write(f"DEBUG_ALL_CALLBACKS: Received callback_data: '{call.data}' from user {call.from_user.id}\n")
-    # Важно: всегда отвечайте на callback_query, иначе кнопка будет выглядеть "висящей"
-    bot.answer_callback_query(call.id, "Обработка запроса...")
-
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    sys.stderr.write(f"DEBUG: /start command received from user {message.from_user.id}\n")
-    user_telegram_id = message.from_user.id
-    username = message.from_user.username if message.from_user.username else f"id{user_telegram_id}"
-    chat_id = message.chat.id
-
-    try:
-        user = db.get_user(user_telegram_id)
-        if not user:
-            sys.stderr.write(f"DEBUG: User {user_telegram_id} not found, creating new user.\n")
-            user = db.create_user(user_telegram_id, username)
-            if not user:
-                bot.send_message(chat_id, "Извините, не удалось создать вашу учетную запись. Пожалуйста, попробуйте еще раз.")
-                sys.stderr.write(f"ERROR: Failed to create user for telegram_id {user_telegram_id}.\n")
-                return
-
-            bot.send_message(chat_id, "Добро пожаловать в Tamacoin Game! Выберите своего первого питомца:")
-
-            markup = types.InlineKeyboardMarkup()
-            for pet_type_key, pet_info in PET_TYPES.items():
-                markup.add(types.InlineKeyboardButton(text=pet_info['name'], callback_data=f"choose_pet_{pet_type_key}"))
-            bot.send_message(chat_id, "Кого вы хотите завести?", reply_markup=markup)
-            sys.stderr.write("DEBUG: Sent pet selection message to new user.\n")
-        else:
-            sys.stderr.write(f"DEBUG: User {user_telegram_id} already exists. Checking for pet.\n")
-            pet = db.get_pet(user['id'])
-            if pet:
-                sys.stderr.write(f"DEBUG: User {user_telegram_id} has pet {pet['id']}. Updating pet stats over time.\n")
-                pet = update_pet_stats_over_time(pet) # Обновляем состояние питомца
-
-                status_text, image_path = get_pet_status_and_image(pet)
-
-                if pet['is_alive'] == 0:
-                    bot.send_message(chat_id, f"Привет снова, {user['username']}! Ваш баланс: {user['balance']} Tamacoin.")
-                    bot.send_message(chat_id, f"Ваш питомец {pet['name']} мертв. 😢\n"
-                                               f"Вы можете приобрести нового питомца за {NEW_PET_COST} Tamacoin, используя команду /new_pet (если она у вас есть) или нажав /start еще раз.")
-                    try:
-                        # Убедитесь, что PET_IMAGES['dead_pet'] содержит правильный путь
-                        with open(PET_IMAGES['dead_pet'], 'rb') as photo:
-                            bot.send_photo(chat_id, photo, caption="Покойся с миром, друг.")
-                        sys.stderr.write(f"DEBUG: Sent dead pet photo for user {user_telegram_id}.\n")
-                    except FileNotFoundError:
-                        bot.send_message(chat_id, "Изображение могилы не найдено. Проверьте путь в pet_config.py.")
-                        sys.stderr.write(f"ERROR: Image not found at {PET_IMAGES['dead_pet']} for user {user_telegram_id}.\n")
-                    except Exception as e:
-                        bot.send_message(chat_id, f"Произошла ошибка при отправке фото. Ваш статус:\n{status_text}")
-                        sys.stderr.write(f"ERROR: Failed to send dead pet photo for user {user_telegram_id}: {e}\n")
-                        import traceback
-                        sys.stderr.write(traceback.format_exc())
-                    return # Важно выйти после обработки мертвого питомца
-
-                # Если питомец жив
-                bot.send_message(chat_id, f"Привет снова, {user['username']}! Ваш баланс: {user['balance']} Tamacoin.")
-
-                try:
-                    # Убедитесь, что image_path содержит правильный путь
-                    with open(image_path, 'rb') as photo:
-                        bot.send_photo(chat_id, photo, caption=status_text)
-                    sys.stderr.write(f"DEBUG: Sent pet status photo for existing user {user_telegram_id}.\n")
-                except FileNotFoundError:
-                    bot.send_message(chat_id, f"Ой, не могу найти изображение для питомца. Ваш статус:\n{status_text}\nПроверьте путь к изображению.")
-                    sys.stderr.write(f"ERROR: Image not found at {image_path} for user {user_telegram_id}.\n")
-                except Exception as e:
-                    bot.send_message(chat_id, f"Произошла ошибка при отправке фото. Ваш статус:\n{status_text}")
-                    sys.stderr.write(f"ERROR: Failed to send photo for user {user_telegram_id}: {e}\n")
-                    import traceback
-                    sys.stderr.write(traceback.format_exc())
-
-            else:
-                sys.stderr.write(f"DEBUG: User {user_telegram_id} exists but has no pet. Prompting for selection.\n")
-                bot.send_message(chat_id, "Добро пожаловать обратно! Вы еще не выбрали питомца. Выберите одного:")
-                markup = types.InlineKeyboardMarkup()
-                for pet_type_key, pet_info in PET_TYPES.items():
-                    markup.add(types.InlineKeyboardButton(text=pet_info['name'], callback_data=f"choose_pet_{pet_type_key}"))
-                bot.send_message(chat_id, "Кого вы хотите завести?", reply_markup=markup)
-                sys.stderr.write("DEBUG: Sent pet selection message to existing user without pet.\n")
-    except Exception as e:
-        sys.stderr.write(f"ERROR: Unhandled exception in send_welcome for user {user_telegram_id}: {e}\n")
-        import traceback
-        sys.stderr.write(traceback.format_exc())
-        bot.send_message(chat_id, "Произошла непредвиденная ошибка при обработке команды /start. Пожалуйста, попробуйте позже.")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('choose_pet_'))
-def callback_choose_pet(call):
-    sys.stderr.write(f"DEBUG: callback_choose_pet called for user {call.from_user.id} with data '{call.data}'\n")
-    chat_id = call.message.chat.id
-    user_telegram_id = call.from_user.id
-    message_id = call.message.message_id
+async def button_callback_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
     
-    try:
-        user = db.get_user(user_telegram_id)
-        if not user:
-            # Это может произойти, если пользователь удалил бота и начал снова,
-            # но callback пришел до того, как /start завершил создание пользователя.
-            # Попробуем создать пользователя еще раз, или проинформируем.
-            sys.stderr.write(f"ERROR: User {user_telegram_id} not found in DB during callback_choose_pet. Attempting re-creation.\n")
-            username = call.from_user.username if call.from_user.username else f"id{user_telegram_id}"
-            user = db.create_user(user_telegram_id, username)
-            if not user:
-                bot.answer_callback_query(call.id, "Не удалось создать пользователя. Попробуйте начать сначала командой /start.")
-                sys.stderr.write(f"ERROR: Failed to create user {user_telegram_id} even after retry in callback_choose_pet.\n")
-                return
+    user_id = query.from_user.id
+    telegram_id = query.from_user.id # Use telegram_id directly for getting user record
+    
+    # Get the internal user_id from the database
+    user_record = db_manager.get_user(telegram_id) # Изменено
+    if user_record:
+        internal_user_id = user_record[0]
+    else:
+        # This scenario shouldn't happen if user started with /start
+        await query.edit_message_text("Произошла ошибка: не удалось найти вашего пользователя. Пожалуйста, начните с /start.")
+        return
 
-        if user['pet_id']:
-            bot.answer_callback_query(call.id, "У вас уже есть питомец!")
-            bot.send_message(chat_id, "У вас уже есть питомец. Для получения информации используйте /status.")
-            sys.stderr.write(f"DEBUG: User {user_telegram_id} already has a pet, callback handled.\n")
-            return
-
-        pet_type_key = call.data.replace('choose_pet_', '')
-        if pet_type_key not in PET_TYPES:
-            bot.answer_callback_query(call.id, "Неизвестный тип питомца.")
-            sys.stderr.write(f"ERROR: Unknown pet type key received: {pet_type_key} from user {user_telegram_id}.\n")
-            return
-
-        pet_info = PET_TYPES[pet_type_key]
-        pet_name = pet_info['name']
+    data = query.data
+    if data.startswith("select_pet_"):
+        pet_type = data.split("_")[2]
+        pet_name = pet_type # For simplicity, name is same as type initially
         
-        owner_db_id = user['id'] 
-        sys.stderr.write(f"DEBUG: Creating pet for owner_db_id: {owner_db_id} with type {pet_type_key}.\n")
-        new_pet = db.create_pet(owner_db_id, pet_type_key, pet_name)
+        existing_pet = db_manager.get_pet(internal_user_id) # Изменено
+        if existing_pet:
+            await query.edit_message_text(f"У вас уже есть питомец: {existing_pet[3]} ({existing_pet[2]}).")
+            # Optionally send current pet status
+            await game_instance.send_pet_status(query.message.chat_id, internal_user_id) # Изменено
+            return
 
-        if new_pet:
-            bot.answer_callback_query(call.id, f"Вы выбрали {pet_name}!")
-            status_text, image_path = get_pet_status_and_image(new_pet)
+        success = db_manager.create_pet(internal_user_id, pet_type, pet_name) # Изменено
+        if success:
+            await query.edit_message_text(f"Поздравляем! Вы завели питомца: {pet_name} ({pet_type}).")
             
-            try:
-                with open(image_path, 'rb') as photo:
-                    bot.send_photo(chat_id, photo, caption=f"Поздравляем, вы завели {pet_name}!\n\n{status_text}")
-                sys.stderr.write(f"DEBUG: Sent new pet photo to user {user_telegram_id}.\n")
-            except FileNotFoundError:
-                bot.send_message(chat_id, f"Поздравляем, вы завели {pet_name}!\n\nОй, не могу найти изображение для питомца. Ваш статус:\n{status_text}\nПроверьте путь к изображению.")
-                sys.stderr.write(f"ERROR: Image not found at {image_path} for new pet of user {user_telegram_id}.\n")
-            except Exception as e:
-                bot.send_message(chat_id, f"Поздравляем, вы завели {pet_name}!\n\nПроизошла ошибка при отправке фото. Ваш статус:\n{status_text}")
-                sys.stderr.write(f"ERROR: Failed to send new pet photo for user {user_telegram_id}: {e}\n")
-                import traceback
-                sys.stderr.write(traceback.format_exc())
+            image_path = pet_config.PET_IMAGES.get(pet_type)
+            if image_path and os.path.exists(image_path):
+                with open(image_path, 'rb') as image_file:
+                    await context.bot.send_photo(chat_id=query.message.chat_id, photo=InputFile(image_file), caption=f"{pet_name} ({pet_type})")
+            else:
+                await context.bot.send_message(chat_id=query.message.chat_id, text=f"Изображение для {pet_type} не найдено.")
 
-            try:
-                # Удаляем кнопки выбора питомца после выбора
-                bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None) 
-                sys.stderr.write(f"DEBUG: Pet selection buttons removed for user {user_telegram_id}.\n")
-            except Exception as e:
-                sys.stderr.write(f"ERROR: Failed to edit message reply markup for user {user_telegram_id}: {e}\n")
-                # Это может произойти, если сообщение уже было изменено или слишком старое. Можно проигнорировать.
-                pass
-
-            bot.send_message(chat_id, "Теперь вы можете ухаживать за своим питомцем, используя команды, такие как /feed, /play, /clean и т.д.")
+            await game_instance.send_pet_status(query.message.chat_id, internal_user_id) # Изменено
         else:
-            bot.answer_callback_query(call.id, "Не удалось создать питомца.")
-            sys.stderr.write(f"ERROR: Failed to create pet for user {user_telegram_id} for unknown reason.\n")
+            await query.edit_message_text("Не удалось завести питомца. Возможно, у вас уже есть питомец или произошла ошибка.")
 
-    except Exception as e:
-        sys.stderr.write(f"ERROR: Unhandled exception in callback_choose_pet for user {call.from_user.id}: {e}\n")
-        import traceback
-        sys.stderr.write(traceback.format_exc())
-        bot.answer_callback_query(call.id, "Произошла внутренняя ошибка.")
-        bot.send_message(chat_id, "Произошла непредвиденная ошибка. Попробуйте позже.")
-
-@bot.message_handler(commands=['info'])
-def send_info(message):
-    sys.stderr.write(f"DEBUG: /info command received from user {message.from_user.id}\n")
-    bot.send_message(message.chat.id, INFO_TEXT, parse_mode='Markdown')
-    sys.stderr.write("DEBUG: Sent INFO_TEXT.\n")
-
-@bot.message_handler(commands=['help'])
-def send_help(message):
-    sys.stderr.write(f"DEBUG: /help command received from user {message.from_user.id}\n")
-    bot.send_message(message.chat.id, HELP_TEXT, parse_mode='Markdown')
-    sys.stderr.write("DEBUG: Sent HELP_TEXT.\n")
-
-@bot.message_handler(commands=['status'])
-def send_status(message):
-    sys.stderr.write(f"DEBUG: /status command received from user {message.from_user.id}\n")
-    user_telegram_id = message.from_user.id
-    chat_id = message.chat.id
-
-    try:
-        user = db.get_user(user_telegram_id)
-        if not user:
-            bot.send_message(chat_id, "Вы еще не начали игру! Используйте команду /start.")
-            sys.stderr.write(f"DEBUG: User {user_telegram_id} not found for /status.\n")
-            return
-
-        pet = db.get_pet(user['id'])
-        if not pet:
-            bot.send_message(chat_id, "У вас еще нет питомца! Выберите его, используя команду /start.")
-            sys.stderr.write(f"DEBUG: User {user_telegram_id} has no pet for /status.\n")
-            return
-
-        pet = update_pet_stats_over_time(pet)
-
-        status_text, image_path = get_pet_status_and_image(pet)
-        user_balance_text = f"Ваш баланс: {user['balance']} Tamacoin."
-
-        try:
-            with open(image_path, 'rb') as photo:
-                bot.send_photo(chat_id, photo, caption=f"{user_balance_text}\n\n{status_text}")
-            sys.stderr.write(f"DEBUG: Sent pet status photo for user {user_telegram_id} via /status.\n")
-        except FileNotFoundError:
-            bot.send_message(chat_id, f"{user_balance_text}\n\nОй, не могу найти изображение для питомца. Ваш статус:\n{status_text}\nПроверьте путь к изображению.")
-            sys.stderr.write(f"ERROR: Image not found at {image_path} for user {user_telegram_id} via /status.\n")
-        except Exception as e:
-            bot.send_message(chat_id, f"{user_balance_text}\n\nПроизошла ошибка при отправке фото. Ваш статус:\n{status_text}")
-            sys.stderr.write(f"ERROR: Failed to send photo for user {user_telegram_id} via /status: {e}\n")
-            import traceback
-            sys.stderr.write(traceback.format_exc())
-
-    except Exception as e:
-        sys.stderr.write(f"ERROR: Unhandled exception in send_status for user {user_telegram_id}: {e}\n")
-        import traceback
-        sys.stderr.write(traceback.format_exc())
-        bot.send_message(chat_id, "Произошла непредвиденная ошибка при получении статуса. Пожалуйста, попробуйте позже.")
-
-
-# --- Добавленные обработчики-заглушки для других команд ---
-
-@bot.message_handler(commands=['feed'])
-def feed_pet_command(message):
-    sys.stderr.write(f"DEBUG: /feed command received from user {message.from_user.id}\n")
-    chat_id = message.chat.id
-    user_telegram_id = message.from_user.id
-    user = db.get_user(user_telegram_id)
-
-    if not user:
-        bot.send_message(chat_id, "Вы еще не начали игру! Используйте команду /start.")
-        return
-    
-    pet = db.get_pet(user['id'])
-    if not pet:
-        bot.send_message(chat_id, "У вас еще нет питомца! Выберите его, используя команду /start.")
-        return
-    
-    if pet['is_alive'] == 0:
-        bot.send_message(chat_id, "Ваш питомец мертв. Вы не можете с ним взаимодействовать.")
-        return
-    
-    # Placeholder: Здесь будет логика кормления
-    bot.send_message(chat_id, "Вы покормили своего питомца! (Логика кормления пока не реализована полностью)")
-    sys.stderr.write(f"DEBUG: User {user_telegram_id} sent /feed.\n")
-
-@bot.message_handler(commands=['play'])
-def play_pet_command(message):
-    sys.stderr.write(f"DEBUG: /play command received from user {message.from_user.id}\n")
-    chat_id = message.chat.id
-    user_telegram_id = message.from_user.id
-    user = db.get_user(user_telegram_id)
-
-    if not user:
-        bot.send_message(chat_id, "Вы еще не начали игру! Используйте команду /start.")
-        return
-    
-    pet = db.get_pet(user['id'])
-    if not pet:
-        bot.send_message(chat_id, "У вас еще нет питомца! Выберите его, используя команду /start.")
-        return
-    
-    if pet['is_alive'] == 0:
-        bot.send_message(chat_id, "Ваш питомец мертв. Вы не можете с ним взаимодействовать.")
+async def status_command(update: Update, context):
+    user_id = update.effective_user.id
+    user = db_manager.get_user(user_id) # Изменено
+    if user is None:
+        await update.message.reply_text("Пожалуйста, начните игру с команды /start.")
         return
 
-    # Placeholder: Здесь будет логика игры
-    bot.send_message(chat_id, "Вы поиграли со своим питомцем! (Логика игры пока не реализована полностью)")
-    sys.stderr.write(f"DEBUG: User {user_telegram_id} sent /play.\n")
-
-@bot.message_handler(commands=['clean'])
-def clean_pet_command(message):
-    sys.stderr.write(f"DEBUG: /clean command received from user {message.from_user.id}\n")
-    chat_id = message.chat.id
-    user_telegram_id = message.from_user.id
-    user = db.get_user(user_telegram_id)
-
-    if not user:
-        bot.send_message(chat_id, "Вы еще не начали игру! Используйте команду /start.")
-        return
-    
-    pet = db.get_pet(user['id'])
-    if not pet:
-        bot.send_message(chat_id, "У вас еще нет питомца! Выберите его, используя команду /start.")
-        return
-    
-    if pet['is_alive'] == 0:
-        bot.send_message(chat_id, "Ваш питомец мертв. Вы не можете с ним взаимодействовать.")
-        return
-
-    # Placeholder: Здесь будет логика уборки
-    bot.send_message(chat_id, "Вы убрали за своим питомцем! (Логика уборки пока не реализована полностью)")
-    sys.stderr.write(f"DEBUG: User {user_telegram_id} sent /clean.\n")
-
-@bot.message_handler(commands=['shop'])
-def open_shop(message):
-    sys.stderr.write(f"DEBUG: /shop command received from user {message.from_user.id}\n")
-    chat_id = message.chat.id
-    bot.send_message(chat_id, "Магазин пока закрыт на реконструкцию. Заходите позже!")
-    sys.stderr.write(f"DEBUG: User {message.from_user.id} sent /shop.\n")
-
-@bot.message_handler(commands=['daily_bonus'])
-def get_daily_bonus(message):
-    sys.stderr.write(f"DEBUG: /daily_bonus command received from user {message.from_user.id}\n")
-    chat_id = message.chat.id
-    user_telegram_id = message.from_user.id
-    user = db.get_user(user_telegram_id)
-
-    if not user:
-        bot.send_message(chat_id, "Вы еще не начали игру! Используйте команду /start.")
-        return
-
-    # Placeholder: Здесь будет логика ежедневного бонуса
-    bot.send_message(chat_id, "Ежедневный бонус будет доступен скоро! (Логика пока не реализована)")
-    sys.stderr.write(f"DEBUG: User {user_telegram_id} sent /daily_bonus.\n")
-
-@bot.message_handler(commands=['users_count'])
-def get_users_count(message):
-    sys.stderr.write(f"DEBUG: /users_count command received from user {message.from_user.id}\n")
-    chat_id = message.chat.id
-    try:
-        count = db.get_total_users_count()
-        bot.send_message(chat_id, f"Общее количество пользователей: {count}.")
-        sys.stderr.write(f"DEBUG: Sent users count to user {message.from_user.id}.\n")
-    except Exception as e:
-        sys.stderr.write(f"ERROR: Failed to get users count for user {message.from_user.id}: {e}\n")
-        bot.send_message(chat_id, "Не удалось получить количество пользователей.")
-
-@bot.message_handler(commands=['admin_stats'])
-def admin_stats(message):
-    sys.stderr.write(f"DEBUG: /admin_stats command received from user {message.from_user.id}\n")
-    chat_id = message.chat.id
-    user_telegram_id = message.from_user.id
-
-    if user_telegram_id != ADMIN_TELEGRAM_ID:
-        bot.send_message(chat_id, "У вас нет прав для выполнения этой команды.")
-        sys.stderr.write(f"WARNING: Non-admin user {user_telegram_id} attempted /admin_stats.\n")
-        return
-    
-    try:
-        stats = db.get_game_stats()
-        if stats:
-            response = (
-                f"📊 *Административная статистика:*\n"
-                f"Всего Tamacoin в обращении: `{stats['total_tamacoins_circulating']:.2f}`\n"
-                f"Всего создано питомцев: `{stats['total_pets_created']}`\n"
-                f"Последнее обновление: `{stats['last_update']}`"
-            )
-            bot.send_message(chat_id, response, parse_mode='Markdown')
-            sys.stderr.write(f"DEBUG: Sent admin stats to admin {user_telegram_id}.\n")
-        else:
-            bot.send_message(chat_id, "Статистика игры не найдена.")
-            sys.stderr.write(f"ERROR: Game stats not found for admin {user_telegram_id}.\n")
-    except Exception as e:
-        sys.stderr.write(f"ERROR: Failed to get admin stats for user {user_telegram_id}: {e}\n")
-        import traceback
-        sys.stderr.write(traceback.format_exc())
-        bot.send_message(chat_id, "Произошла ошибка при получении административной статистики.")
-
-
-@app.route(f'/{API_TOKEN}', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        sys.stderr.write(f"DEBUG_WEBHOOK: Received webhook update: {json_string[:200]}...\n")
-        try:
-            update = telebot.types.Update.de_json(json_string)
-            bot.process_new_updates([update])
-            sys.stderr.write("DEBUG_WEBHOOK: Successfully processed update.\n")
-            return '', 200
-        except Exception as e:
-            sys.stderr.write(f"ERROR_WEBHOOK: Error processing update: {e}\n")
-            import traceback
-            sys.stderr.write(traceback.format_exc())
-            return '', 500
+    internal_user_id = user[0]
+    pet = db_manager.get_pet(internal_user_id) # Изменено
+    if pet is None:
+        await update.message.reply_text("У вас еще нет питомца! Выберите его, используя команду /start.")
     else:
-        sys.stderr.write("ERROR_WEBHOOK: Webhook received non-JSON content. Content-Type: " + request.headers.get('content-type') + "\n")
-        return '', 403
+        await game_instance.send_pet_status(update.effective_chat.id, internal_user_id) # Изменено
 
-if __name__ == '__main__':
-    if API_TOKEN and WEBHOOK_HOST:
-        sys.stderr.write("DEBUG: API_TOKEN and WEBHOOK_HOST are set. Attempting to set webhook.\n")
-        try:
-            bot.remove_webhook()
-            sys.stderr.write("DEBUG: Old webhook removed (if any).\n")
-            bot.set_webhook(url=WEBHOOK_URL)
-            sys.stderr.write(f"DEBUG: Webhook set to {WEBHOOK_URL}\n")
-            sys.stderr.write("DEBUG: Starting Flask app.run on 0.0.0.0:PORT.\n")
-            app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 10000)))
-        except Exception as e:
-            sys.stderr.write(f"FATAL_ERROR: Failed to set webhook or start Flask app: {e}\n")
-            import traceback
-            sys.stderr.write(traceback.format_exc())
+async def feed_command(update: Update, context):
+    user_id = update.effective_user.id
+    user = db_manager.get_user(user_id) # Изменено
+    if user is None:
+        await update.message.reply_text("Пожалуйста, начните игру с команды /start.")
+        return
+
+    internal_user_id = user[0]
+    pet = db_manager.get_pet(internal_user_id) # Изменено
+    if pet is None:
+        await update.message.reply_text("У вас еще нет питомца! Выберите его, используя команду /start.")
     else:
-        sys.stderr.write("ERROR: API_TOKEN or WEBHOOK_HOST environment variable not set.\n")
-        sys.stderr.write("Bot will not run via webhook on Render.com.\n")
-        sys.stderr.write("For local testing, consider uncommenting bot.polling(none_stop=True).\n")
+        await game_instance.feed_pet(update.effective_chat.id, internal_user_id) # Изменено
+
+async def play_command(update: Update, context):
+    user_id = update.effective_user.id
+    user = db_manager.get_user(user_id) # Изменено
+    if user is None:
+        await update.message.reply_text("Пожалуйста, начните игру с команды /start.")
+        return
+
+    internal_user_id = user[0]
+    pet = db_manager.get_pet(internal_user_id) # Изменено
+    if pet is None:
+        await update.message.reply_text("У вас еще нет питомца! Выберите его, используя команду /start.")
+    else:
+        await game_instance.play_with_pet(update.effective_chat.id, internal_user_id) # Изменено
+
+async def clean_command(update: Update, context):
+    user_id = update.effective_user.id
+    user = db_manager.get_user(user_id) # Изменено
+    if user is None:
+        await update.message.reply_text("Пожалуйста, начните игру с команды /start.")
+        return
+
+    internal_user_id = user[0]
+    pet = db_manager.get_pet(internal_user_id) # Изменено
+    if pet is None:
+        await update.message.reply_text("У вас еще нет питомца! Выберите его, используя команду /start.")
+    else:
+        await game_instance.clean_pet_area(update.effective_chat.id, internal_user_id) # Изменено
+
+async def shop_command(update: Update, context):
+    await update.message.reply_text(SHOP_CLOSED_MESSAGE)
+
+async def daily_bonus_command(update: Update, context):
+    await update.message.reply_text(DAILY_BONUS_UNAVAILABLE)
+
+async def info_command(update: Update, context):
+    await update.message.reply_text(INFO_TEXT, parse_mode='Markdown')
+
+async def users_count_command(update: Update, context):
+    count = db_manager.get_total_users_count() # Изменено
+    await update.message.reply_text(f"Общее количество пользователей: {count}.")
+
+async def admin_stats_command(update: Update, context):
+    # !!! Важно: в реальном приложении нужно добавить проверку на администратора !!!
+    # Например: if update.effective_user.id != YOUR_ADMIN_TELEGRAM_ID: return
+    
+    stats = db_manager.get_game_stats() # Изменено
+    if stats:
+        await update.message.reply_text(
+            f"Административная статистика:\n"
+            f"Всего эмитировано Tamacoin: {stats.get('total_emitted_tamacoin', 0)}\n"
+            f"Всего пользователей: {stats.get('total_users', 0)}"
+        )
+    else:
+        await update.message.reply_text("Произошла ошибка при получении административной статистики.")
+
+async def echo(update: Update, context):
+    await update.message.reply_text("Я не понимаю этой команды. Используйте /help для списка команд.")
+
+
+def main():
+    application = Application.builder().token(TOKEN).build()
+
+    # Обработчики команд
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("feed", feed_command))
+    application.add_handler(CommandHandler("play", play_command))
+    application.add_handler(CommandHandler("clean", clean_command))
+    application.add_handler(CommandHandler("shop", shop_command))
+    application.add_handler(CommandHandler("daily_bonus", daily_bonus_command))
+    application.add_handler(CommandHandler("info", info_command))
+    application.add_handler(CommandHandler("users_count", users_count_command))
+    application.add_handler(CommandHandler("admin_stats", admin_stats_command))
+
+    # Обработчик callback-кнопок
+    application.add_handler(CallbackQueryHandler(button_callback_handler))
+
+    # Обработчик для всех остальных сообщений (опционально)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    # Запуск бота на Render с вебхуками
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=TOKEN,
+        webhook_url=WEBHOOK_HOST + '/' + TOKEN
+    )
+
+if __name__ == "__main__":
+    main()
 
